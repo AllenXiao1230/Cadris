@@ -34,6 +34,7 @@ type NativeSyncStatus = { available: boolean; pending: number; issues: { relativ
 type ReviewSession = { id: string; activePath?: string; reviewedCount: number; totalCount: number; pausedAt?: number };
 type BurstBestFrame = { burstId: string; relativePath: string };
 type DecisionHistoryEntry = { id: number; previousDecision: Decision; nextDecision: Decision; previousRating: number; nextRating: number; changedAt: number };
+type ReviewSnapshot = { id: string; label: string; createdAt: number };
 
 const labels: Record<Decision, string> = { unreviewed: "未審", keep: "保留", reject: "淘汰" };
 const defaultShortcuts: ShortcutMap = { keep: "Z", reject: "X", unreviewed: "U", "rating-0": "0", "rating-1": "1", "rating-2": "2", "rating-3": "3", "rating-4": "4", "rating-5": "5", previous: "ArrowLeft", next: "ArrowRight", "toggle-view": "Space", grid: "G", "compare-toggle": "C", "zoom-out": "-", "zoom-in": "=" };
@@ -166,6 +167,7 @@ export default function App() {
   const [assistance, setAssistance] = useState<AssistanceResult[]>([]);
   const [burstBestFrames, setBurstBestFrames] = useState<Map<string, string>>(new Map());
   const [decisionHistory, setDecisionHistory] = useState<DecisionHistoryEntry[]>([]);
+  const [reviewSnapshots, setReviewSnapshots] = useState<ReviewSnapshot[]>([]);
   const [settings, setSettings] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [lastAction, setLastAction] = useState<LastAction | null>(null);
@@ -321,13 +323,14 @@ export default function App() {
 
   async function refreshLibraryTools(folder = root) {
     if (!folder) return;
-    const [cache, sync, session, bestFrames] = await Promise.all([
+    const [cache, sync, session, bestFrames, snapshots] = await Promise.all([
       invoke<CacheStatus>("cache_status", { root: folder }).catch(() => null),
       invoke<NativeSyncStatus>("native_sync_status", { root: folder }).catch(() => null),
       invoke<ReviewSession | null>("resume_review_session", { root: folder }).catch(() => null),
       invoke<BurstBestFrame[]>("burst_best_frames", { root: folder }).catch(() => []),
+      invoke<ReviewSnapshot[]>("review_snapshots", { root: folder }).catch(() => []),
     ]);
-    setCacheStatus(cache); setSyncStatus(sync); setReviewSession(session); setBurstBestFrames(new Map(bestFrames.map((frame) => [frame.burstId, frame.relativePath])));
+    setCacheStatus(cache); setSyncStatus(sync); setReviewSession(session); setBurstBestFrames(new Map(bestFrames.map((frame) => [frame.burstId, frame.relativePath]))); setReviewSnapshots(snapshots);
   }
 
   async function scan(folder: string) {
@@ -389,8 +392,14 @@ export default function App() {
 
   async function saveSnapshot() {
     if (!root) return;
-    try { await invoke("create_review_snapshot", { root, label: "手動快照" }); setStatus("已在 .cadris/snapshots 建立可攜決定快照。"); notify("已建立快照"); }
+    try { await invoke("create_review_snapshot", { root, label: "手動快照" }); await refreshLibraryTools(); setStatus("已在 .cadris/snapshots 建立可攜決定快照。"); notify("已建立快照"); }
     catch { setStatus("無法建立決定快照。"); }
+  }
+
+  async function mergeSnapshot(id: string) {
+    if (!root) return;
+    try { const restored = await invoke<number>("merge_review_snapshot", { root, id }); await scan(root); setStatus(`已安全合併 ${restored} 項仍存在的照片決定。`); }
+    catch { setStatus("無法合併決定快照。"); }
   }
 
   async function updateSession(paused = false) {
@@ -798,7 +807,7 @@ export default function App() {
       <label className="sort-control"><span className="sr-only">排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortOption)}><option value="name-asc">檔名 A → Z</option><option value="name-desc">檔名 Z → A</option><option value="captured-newest">時間 ↓</option><option value="captured-oldest">時間 ↑</option><option value="rating-desc">星等 ↓</option></select></label>
     </nav>
     {showAdvancedFilters && <AdvancedFilters value={advancedFilter} photos={photos} onChange={setAdvancedFilter} onReset={() => setAdvancedFilter(emptyAdvancedFilter)} onSmartCollection={applySmartCollection} />}
-    {settings ? <SettingsPage root={root} theme={theme} setTheme={setTheme} gridSize={gridSize} setGridSize={setGridSize} autoAdvance={autoAdvance} setAutoAdvance={setAutoAdvance} shortcuts={shortcuts} editingShortcut={editingShortcut} shortcutStatus={shortcutStatus} onClose={closeSettings} onStartShortcutEdit={startShortcutEdit} onRestoreShortcuts={restoreShortcuts} burstGapMs={burstGapMs} setBurstGapMs={setBurstGapMs} previewProfile={previewProfile} setPreviewProfile={setPreviewProfile} preloadCount={preloadCount} setPreloadCount={setPreloadCount} rawCacheOnly={rawCacheOnly} setRawCacheOnly={setRawCacheOnly} cacheStatus={cacheStatus} syncStatus={syncStatus} reviewSession={reviewSession} onUpdateCacheLimit={(limit) => void updateCacheLimit(limit)} onClearDerivedCache={() => void clearDerivedCache()} onRetrySync={(repair) => void retrySync(repair)} onUpdateSession={(paused) => void updateSession(paused)} onSnapshot={() => void saveSnapshot()} onRunAssistance={() => void runAssistance()} onExport={(format) => void exportLibrary(format)} /> : !photos.length ? <section className="empty"><h1>選擇照片資料夾</h1><button type="button" className="primary icon-button" onClick={choose} aria-label="選擇照片資料夾" title="選擇照片資料夾"><Icon name="folder" /></button><p><kbd>Z</kbd>　<kbd>X</kbd>　<kbd>U</kbd>　<kbd>0–5</kbd>　<kbd>Space</kbd></p></section> : <>
+    {settings ? <SettingsPage root={root} theme={theme} setTheme={setTheme} gridSize={gridSize} setGridSize={setGridSize} autoAdvance={autoAdvance} setAutoAdvance={setAutoAdvance} shortcuts={shortcuts} editingShortcut={editingShortcut} shortcutStatus={shortcutStatus} onClose={closeSettings} onStartShortcutEdit={startShortcutEdit} onRestoreShortcuts={restoreShortcuts} burstGapMs={burstGapMs} setBurstGapMs={setBurstGapMs} previewProfile={previewProfile} setPreviewProfile={setPreviewProfile} preloadCount={preloadCount} setPreloadCount={setPreloadCount} rawCacheOnly={rawCacheOnly} setRawCacheOnly={setRawCacheOnly} cacheStatus={cacheStatus} syncStatus={syncStatus} reviewSession={reviewSession} reviewSnapshots={reviewSnapshots} onUpdateCacheLimit={(limit) => void updateCacheLimit(limit)} onClearDerivedCache={() => void clearDerivedCache()} onRetrySync={(repair) => void retrySync(repair)} onUpdateSession={(paused) => void updateSession(paused)} onSnapshot={() => void saveSnapshot()} onMergeSnapshot={(id) => void mergeSnapshot(id)} onRunAssistance={() => void runAssistance()} onExport={(format) => void exportLibrary(format)} /> : !photos.length ? <section className="empty"><h1>選擇照片資料夾</h1><button type="button" className="primary icon-button" onClick={choose} aria-label="選擇照片資料夾" title="選擇照片資料夾"><Icon name="folder" /></button><p><kbd>Z</kbd>　<kbd>X</kbd>　<kbd>U</kbd>　<kbd>0–5</kbd>　<kbd>Space</kbd></p></section> : <>
       {view === "grid" ? <GalleryView root={root} gridMode={gridMode} libraryItems={libraryItems} gridViewportRef={gridViewportRef} gridBounds={gridBounds} rowCount={rowCount} cardHeight={cardHeight} firstRow={firstRow} columnCount={columnCount} virtualStart={virtualStart} virtualItems={virtualItems} galleryHeight={galleryHeight} galleryRows={galleryRows} firstGalleryRow={firstGalleryRow} lastGalleryRow={lastGalleryRow} burstByPhoto={burstByPhoto} burstBestFrames={burstBestFrames} selectedPaths={selectedPaths} comparison={comparison} active={active} onFocusPhoto={focusPhoto} onSelectPhoto={selectPhoto} onOpenLoupe={() => setView("loupe")} onScroll={handleGridScroll} onRememberRatio={rememberRatio} /> : view === "loupe" && current ? <LoupeView root={root} current={current} currentItem={currentItem} currentBurst={currentBurst} isBurstBest={Boolean(currentBurst && burstBestFrames.get(currentBurst.group.id) === current.relativePath)} history={decisionHistory} scale={loupeScale} pan={loupePan} stageRef={loupeStageRef} onStartPan={startLoupePan} onMovePan={moveLoupePan} onEndPan={endLoupePan} onScale={updateLoupeScale} onReset={resetLoupe} onRememberRatio={rememberRatio} onAddBurstToComparison={addBurstToComparison} onMarkBurstBest={() => void markBurstBest()} onRestoreHistory={restoreHistory} /> : view === "compare" && comparisonPhotos.length >= 2 ? <CompareView root={root} photos={comparisonPhotos} zoom={compareZoom} pan={comparePan} onToggleZoom={() => { setCompareZoom((value) => !value); setComparePan({ x: 0, y: 0 }); }} onResetPan={() => setComparePan({ x: 0, y: 0 })} onSetRegion={(region) => { const amount = 180; setCompareZoom(true); setComparePan(region === "center" ? { x: 0, y: 0 } : { x: region.includes("right") ? -amount : amount, y: region.includes("bottom") ? -amount : amount }); }} onReturnToGrid={() => setView("grid")} onRemove={toggleComparison} onStartPan={startComparePan} onMovePan={moveComparePan} onEndPan={endComparePan} /> : <section className="empty"><h1>{view === "compare" ? "至少加入兩張照片才能比較" : "沒有符合篩選的照片"}</h1><p>{view === "compare" ? "回到圖庫，以 C 將照片放入比較清單。" : "調整篩選條件或搜尋文字，繼續檢視圖庫。"}</p></section>}
       <section className="bottom-dock" aria-label="檢視與編輯控制">
         <div className="dock-view" aria-label="檢視方式"><button type="button" aria-pressed={view === "grid"} className={(view === "grid" ? "active " : "") + "icon-button"} onClick={() => setView("grid")} aria-label="圖庫" title="圖庫"><Icon name="grid" /></button><button type="button" aria-pressed={view === "loupe"} className={(view === "loupe" ? "active " : "") + "icon-button"} onClick={() => current && setView("loupe")} aria-label="單張" title="單張"><Icon name="single" /></button><button type="button" aria-pressed={view === "compare"} className={(view === "compare" ? "active " : "") + "icon-button has-count"} onClick={openComparison} aria-label={"比較 " + comparison.length + " 張"} title="比較"><Icon name="compare" /><span>{comparison.length}</span></button>{view === "grid" && <><button type="button" aria-pressed={gridMode === "square"} className={(gridMode === "square" ? "active " : "") + "icon-button"} onClick={() => setGridMode("square")} aria-label="正方形圖庫" title="正方形圖庫"><Icon name="square" /></button><button type="button" aria-pressed={gridMode === "photo"} className={(gridMode === "photo" ? "active " : "") + "icon-button"} onClick={() => setGridMode("photo")} aria-label="依相片比例" title="依相片比例"><Icon name="flow" /></button></>}</div>

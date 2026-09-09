@@ -164,6 +164,27 @@ struct ReviewSession {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ReviewSnapshot {
+    id: String,
+    label: String,
+    created_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotDecision {
+    relative_path: String,
+    decision: String,
+    rating: u8,
+}
+
+#[derive(Deserialize)]
+struct SnapshotState {
+    decisions: Vec<SnapshotDecision>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SyncIssue {
     relative_path: String,
     decision: String,
@@ -1976,6 +1997,90 @@ fn create_review_snapshot(root: String, label: String) -> Result<String, String>
 }
 
 #[tauri::command]
+fn review_snapshots(root: String) -> Result<Vec<ReviewSnapshot>, String> {
+    let connection = open_manifest(Path::new(&root))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, label, created_at FROM review_snapshots ORDER BY created_at DESC LIMIT 30",
+        )
+        .map_err(|error| format!("無法讀取決定快照：{error}"))?;
+    let snapshots = statement
+        .query_map([], |row| {
+            Ok(ReviewSnapshot {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })
+        .map_err(|error| format!("無法讀取決定快照：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("無法讀取決定快照：{error}"))?;
+    Ok(snapshots)
+}
+
+#[tauri::command]
+fn merge_review_snapshot(root: String, id: String) -> Result<usize, String> {
+    let root_path = PathBuf::from(root);
+    let mut connection = open_manifest(&root_path)?;
+    let state_json: String = connection
+        .query_row(
+            "SELECT state_json FROM review_snapshots WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("找不到決定快照：{error}"))?;
+    let snapshot: SnapshotState =
+        serde_json::from_str(&state_json).map_err(|error| format!("決定快照格式無效：{error}"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("無法開始合併快照：{error}"))?;
+    let batch_id = history_batch_id();
+    let mut restored = 0;
+    for entry in snapshot.decisions {
+        if !matches!(entry.decision.as_str(), "unreviewed" | "keep" | "reject") || entry.rating > 5
+        {
+            continue;
+        }
+        if library_photo_path(&root_path, &entry.relative_path).is_err() {
+            continue;
+        }
+        let (previous_decision, previous_rating) =
+            current_decision(&transaction, &entry.relative_path)?;
+        if previous_decision == entry.decision && previous_rating == entry.rating {
+            continue;
+        }
+        transaction.execute(
+            "INSERT INTO decisions(relative_path, decision, rating, updated_at) VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(relative_path) DO UPDATE SET decision = excluded.decision, rating = excluded.rating, updated_at = unixepoch()",
+            params![&entry.relative_path, &entry.decision, entry.rating],
+        ).map_err(|error| format!("無法合併決定快照：{error}"))?;
+        if cfg!(target_os = "macos") {
+            transaction.execute(
+                "INSERT INTO native_sync_queue(relative_path, decision, queued_at, attempts, last_error)
+                 VALUES (?1, ?2, unixepoch(), 0, NULL)
+                 ON CONFLICT(relative_path) DO UPDATE SET decision = excluded.decision, queued_at = excluded.queued_at, attempts = 0, last_error = NULL",
+                params![&entry.relative_path, &entry.decision],
+            ).map_err(|error| format!("無法排入 Finder 標籤同步：{error}"))?;
+        }
+        record_decision_history(
+            &transaction,
+            &batch_id,
+            &entry.relative_path,
+            &previous_decision,
+            &entry.decision,
+            previous_rating,
+            entry.rating,
+        )?;
+        restored += 1;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("無法完成快照合併：{error}"))?;
+    let _ = flush_native_sync_queue(&root_path, &connection);
+    Ok(restored)
+}
+
+#[tauri::command]
 fn export_decisions(root: String, request: ExportRequest) -> Result<(), String> {
     let root_path = PathBuf::from(root);
     let connection = open_manifest(&root_path)?;
@@ -2416,6 +2521,8 @@ pub fn run() {
             resume_review_session,
             update_review_session,
             create_review_snapshot,
+            review_snapshots,
+            merge_review_snapshot,
             export_decisions,
             native_sync_status,
             retry_native_sync,

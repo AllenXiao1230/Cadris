@@ -19,7 +19,7 @@ test.beforeEach(async ({ page }) => {
         if (command === "cache_status") return { bytes: 0, files: 0, limitMb: 2048, failures: [] };
         if (command === "native_sync_status") return { available: true, pending: 0, issues: [] };
         if (command === "resume_review_session") return null;
-        if (command === "burst_best_frames" || command === "decision_history") return [];
+        if (command === "burst_best_frames" || command === "decision_history" || command === "review_snapshots") return [];
         if (command === "update_review_session") return { id: "session", reviewedCount: 0, totalCount: photos.length };
         if (command === "save_ratings_batch" || command === "watch_library") return undefined;
         if (command === "plugin:event|listen") return ++callbackId;
