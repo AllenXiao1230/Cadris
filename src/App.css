@@ -130,6 +130,15 @@ nav input::placeholder { color: var(--quiet); }
 .empty h1 { margin: 0; color: var(--ink); font-size: clamp(25px, 3vw, 34px); letter-spacing: -.035em; }
 .empty p { line-height: 1.65; }
 .empty .primary { margin: 14px auto; }
+.empty-guide { max-width: 540px; padding: 48px 28px; }
+.empty-guide-mark { display: grid; width: 52px; height: 52px; place-items: center; margin: 0 auto 20px; border: 1px solid var(--border); border-radius: 16px; background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 1px 0 var(--highlight); }
+.empty-guide-mark .icon { width: 25px; height: 25px; }
+.empty-guide .empty-lede { max-width: 38ch; margin: 12px auto 0; }
+.empty .open-library-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; margin: 24px auto 18px; }
+.open-library-button .icon { width: 18px; height: 18px; }
+.empty-guide .empty-help { margin: 0; color: var(--quiet); font-size: 12px; }
+.empty-shortcuts { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px 14px; margin: 9px auto 0; color: var(--muted); font-size: 13px; }
+.empty-shortcuts span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 kbd { display: inline-block; min-width: 22px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 6px; background: var(--control); box-shadow: inset 0 1px 0 var(--highlight); color: var(--ink); font-size: .9em; }
 
 .loupe { display: grid; flex: 1; min-height: 0; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; padding: 12px; }
