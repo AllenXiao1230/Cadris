@@ -8,6 +8,7 @@ import { GalleryView } from "./components/GalleryView";
 import { Icon } from "./components/Icon";
 import { LoupeView } from "./components/LoupeView";
 import { SettingsPage } from "./components/SettingsPage";
+import { AdvancedFilters, emptyAdvancedFilter, type AdvancedFilter } from "./components/AdvancedFilters";
 import { usePhotoKeyboard } from "./hooks/usePhotoKeyboard";
 import { selectionForItem } from "./lib/photos";
 import "./App.css";
@@ -17,7 +18,7 @@ type View = "grid" | "loupe" | "compare";
 type SortOption = "name-asc" | "name-desc" | "captured-newest" | "captured-oldest" | "rating-desc";
 type ShortcutAction = "keep" | "reject" | "unreviewed" | "rating-0" | "rating-1" | "rating-2" | "rating-3" | "rating-4" | "rating-5" | "previous" | "next" | "toggle-view" | "grid" | "compare-toggle" | "zoom-out" | "zoom-in";
 type ShortcutMap = Record<ShortcutAction, string>;
-type Photo = { path: string; relativePath: string; name: string; extension: string; size: number; modifiedAt: number; camera?: string; lens?: string; capturedAt?: string; exposure?: string; focalLength?: string; exposureCompensation?: string; dimensions?: string; shooting?: string; orientation?: string; decision: Decision; rating: number; ratio?: number };
+type Photo = { path: string; relativePath: string; name: string; extension: string; size: number; modifiedAt: number; camera?: string; lens?: string; capturedAt?: string; exposure?: string; aperture?: string; iso?: string; focalLength?: string; exposureCompensation?: string; dimensions?: string; shooting?: string; orientation?: string; decision: Decision; rating: number; ratio?: number };
 type BatchDecisionSaveResult = { nativeSynced: number; pendingNativeSync: number };
 type LastAction = { photos: (Pick<Photo, "relativePath" | "name"> & { before: Decision | number })[]; field: "decision" | "rating"; after: Decision | number };
 type LibraryItem = { key: string; kind: "photo" | "pair"; primary: Photo; photos: Photo[] };
@@ -27,6 +28,12 @@ type BurstGroup = { id: string; photos: Photo[] };
 type LibraryChange = { root: string; paths: string[] };
 type ScanUpdate = { root: string; phase: string; processed: number; total: number; photos: Photo[] };
 type Theme = "midnight" | "graphite" | "warm";
+type AssistanceResult = { relativePath: string; blurHint: boolean; exposureHint?: string; similarGroup?: string; eyeHint?: string };
+type CacheStatus = { bytes: number; files: number; limitMb: number; failures: { relativePath: string; error: string; updatedAt: number }[] };
+type NativeSyncStatus = { available: boolean; pending: number; issues: { relativePath: string; decision: string; attempts: number; lastError?: string }[] };
+type ReviewSession = { id: string; activePath?: string; reviewedCount: number; totalCount: number; pausedAt?: number };
+type BurstBestFrame = { burstId: string; relativePath: string };
+type DecisionHistoryEntry = { id: number; previousDecision: Decision; nextDecision: Decision; previousRating: number; nextRating: number; changedAt: number };
 
 const labels: Record<Decision, string> = { unreviewed: "未審", keep: "保留", reject: "淘汰" };
 const defaultShortcuts: ShortcutMap = { keep: "Z", reject: "X", unreviewed: "U", "rating-0": "0", "rating-1": "1", "rating-2": "2", "rating-3": "3", "rating-4": "4", "rating-5": "5", previous: "ArrowLeft", next: "ArrowRight", "toggle-view": "Space", grid: "G", "compare-toggle": "C", "zoom-out": "-", "zoom-in": "=" };
@@ -100,7 +107,7 @@ function buildLibraryItems(photos: Photo[]): LibraryItem[] {
   return items;
 }
 
-function buildBurstGroups(items: LibraryItem[]): BurstGroup[] {
+function buildBurstGroups(items: LibraryItem[], gapMs = 1500): BurstGroup[] {
   const byFolder = new Map<string, { photo: Photo; timestamp: number }[]>();
   items.forEach((item) => {
     const timestamp = captureTime(item.primary.capturedAt);
@@ -119,7 +126,7 @@ function buildBurstGroups(items: LibraryItem[]): BurstGroup[] {
     };
     ordered.forEach((entry) => {
       const previous = sequence[sequence.length - 1];
-      if (previous && entry.timestamp - previous.timestamp > 1500) finish();
+      if (previous && entry.timestamp - previous.timestamp > gapMs) finish();
       sequence.push(entry);
     });
     finish();
@@ -141,12 +148,24 @@ export default function App() {
   const [loupeScale, setLoupeScale] = useState(LOUPE_MIN_SCALE);
   const [loupePan, setLoupePan] = useState({ x: 0, y: 0 });
   const [filter, setFilter] = useState<"all" | Decision>("all");
+  const [advancedFilter, setAdvancedFilter] = useState<AdvancedFilter>(emptyAdvancedFilter);
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
   const [search, setSearch] = useState("");
   const [searchResults, setSearchResults] = useState<string[] | null>(null);
   const [externalChanges, setExternalChanges] = useState(0);
   const [status, setStatus] = useState("開啟一個照片資料夾，開始篩選。");
   const [gridSize, setGridSize] = useState(185);
   const [autoAdvance, setAutoAdvance] = useState(false);
+  const [burstGapMs, setBurstGapMs] = useState(() => Number(window.localStorage.getItem("cadris.burst-gap-ms")) || 1500);
+  const [previewProfile, setPreviewProfile] = useState<"speed" | "balanced" | "quality">(() => (window.localStorage.getItem("cadris.preview-profile") as "speed" | "balanced" | "quality") || "balanced");
+  const [preloadCount, setPreloadCount] = useState(() => Number(window.localStorage.getItem("cadris.preload-count")) || 12);
+  const [rawCacheOnly, setRawCacheOnly] = useState(false);
+  const [cacheStatus, setCacheStatus] = useState<CacheStatus | null>(null);
+  const [syncStatus, setSyncStatus] = useState<NativeSyncStatus | null>(null);
+  const [reviewSession, setReviewSession] = useState<ReviewSession | null>(null);
+  const [assistance, setAssistance] = useState<AssistanceResult[]>([]);
+  const [burstBestFrames, setBurstBestFrames] = useState<Map<string, string>>(new Map());
+  const [decisionHistory, setDecisionHistory] = useState<DecisionHistoryEntry[]>([]);
   const [settings, setSettings] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [lastAction, setLastAction] = useState<LastAction | null>(null);
@@ -178,10 +197,28 @@ export default function App() {
   }, [photos]);
   const searchPaths = useMemo(() => new Set(searchResults ?? []), [searchResults]);
   const selectedPaths = useMemo(() => new Set(selection), [selection]);
+  const assistanceByPath = useMemo(() => new Map(assistance.map((entry) => [entry.relativePath, entry])), [assistance]);
   const visible = useMemo(() => {
     const term = search.trim().toLocaleLowerCase();
     const matches = photos.filter((photo) => {
       if (filter !== "all" && photo.decision !== filter) return false;
+      if (advancedFilter.camera && photo.camera !== advancedFilter.camera) return false;
+      if (advancedFilter.lens && photo.lens !== advancedFilter.lens) return false;
+      if (advancedFilter.focal && !(photo.focalLength ?? "").toLocaleLowerCase().includes(advancedFilter.focal.toLocaleLowerCase())) return false;
+      if (advancedFilter.iso && !((photo.iso ?? photo.exposure ?? "").toLocaleLowerCase().includes(advancedFilter.iso.toLocaleLowerCase()))) return false;
+      if (advancedFilter.aperture && !((photo.aperture ?? photo.exposure ?? "").toLocaleLowerCase().includes(advancedFilter.aperture.toLocaleLowerCase()))) return false;
+      const captured = (photo.capturedAt ?? "").replace(/^(\d{4}):(\d{2}):(\d{2}).*/, "$1-$2-$3");
+      if (advancedFilter.dateFrom && (!captured || captured < advancedFilter.dateFrom)) return false;
+      if (advancedFilter.dateTo && (!captured || captured > advancedFilter.dateTo)) return false;
+      if (advancedFilter.minRating && photo.rating < Number(advancedFilter.minRating)) return false;
+      if (advancedFilter.minSize && photo.size < Number(advancedFilter.minSize) * 1_000_000) return false;
+      if (advancedFilter.maxSize && photo.size > Number(advancedFilter.maxSize) * 1_000_000) return false;
+      const assist = assistanceByPath.get(photo.relativePath);
+      if (advancedFilter.assistance === "blur" && !assist?.blurHint) return false;
+      if (advancedFilter.assistance === "exposure" && !assist?.exposureHint) return false;
+      if (advancedFilter.assistance === "similar" && !assist?.similarGroup) return false;
+      if (advancedFilter.preview === "failed" && !cacheStatus?.failures.some((failure) => failure.relativePath === photo.relativePath)) return false;
+      if (advancedFilter.preview === "ready" && cacheStatus?.failures.some((failure) => failure.relativePath === photo.relativePath)) return false;
       if (!term) return true;
       if (searchResults) return searchPaths.has(photo.relativePath);
       return [photo.name, photo.camera, photo.lens].filter((value): value is string => Boolean(value)).some((value) => value.toLocaleLowerCase().includes(term));
@@ -193,9 +230,12 @@ export default function App() {
       if (sortBy === "rating-desc") return right.rating - left.rating || left.name.localeCompare(right.name);
       return left.name.localeCompare(right.name, undefined, { numeric: true });
     });
-  }, [photos, filter, search, searchPaths, searchResults, sortBy]);
-  const libraryItems = useMemo(() => buildLibraryItems(visible), [visible]);
-  const burstGroups = useMemo(() => buildBurstGroups(libraryItems), [libraryItems]);
+  }, [photos, filter, search, searchPaths, searchResults, sortBy, advancedFilter, assistanceByPath, cacheStatus]);
+  const preLibraryItems = useMemo(() => buildLibraryItems(visible), [visible]);
+  const preBurstGroups = useMemo(() => buildBurstGroups(preLibraryItems, burstGapMs), [preLibraryItems, burstGapMs]);
+  const preBurstPaths = useMemo(() => new Set(preBurstGroups.flatMap((group) => group.photos.map((photo) => photo.relativePath))), [preBurstGroups]);
+  const libraryItems = useMemo(() => preLibraryItems.filter((item) => (!advancedFilter.burstOnly || item.photos.some((photo) => preBurstPaths.has(photo.relativePath))) && (!advancedFilter.pairedOnly || item.kind === "pair")), [preLibraryItems, advancedFilter.burstOnly, advancedFilter.pairedOnly, preBurstPaths]);
+  const burstGroups = useMemo(() => buildBurstGroups(libraryItems, burstGapMs), [libraryItems, burstGapMs]);
   const burstByPhoto = useMemo(() => {
     const next = new Map<string, { position: number; total: number; group: BurstGroup }>();
     burstGroups.forEach((group) => group.photos.forEach((photo, position) => next.set(photo.relativePath, { position, total: group.photos.length, group })));
@@ -279,6 +319,17 @@ export default function App() {
     if (typeof folder === "string") await scan(folder);
   }
 
+  async function refreshLibraryTools(folder = root) {
+    if (!folder) return;
+    const [cache, sync, session, bestFrames] = await Promise.all([
+      invoke<CacheStatus>("cache_status", { root: folder }).catch(() => null),
+      invoke<NativeSyncStatus>("native_sync_status", { root: folder }).catch(() => null),
+      invoke<ReviewSession | null>("resume_review_session", { root: folder }).catch(() => null),
+      invoke<BurstBestFrame[]>("burst_best_frames", { root: folder }).catch(() => []),
+    ]);
+    setCacheStatus(cache); setSyncStatus(sync); setReviewSession(session); setBurstBestFrames(new Map(bestFrames.map((frame) => [frame.burstId, frame.relativePath])));
+  }
+
   async function scan(folder: string) {
     const changedLibrary = root !== folder;
     scanningRootRef.current = folder;
@@ -298,10 +349,85 @@ export default function App() {
       setActive(0); setView("grid"); setLastAction(null); setComparison([]); setSelection([]); setSelectionAnchor(null); setCompareZoom(false); setComparePan({ x: 0, y: 0 }); setSearchResults(null); setExternalChanges(0);
       let watching = true;
       try { await invoke("watch_library", { root: folder }); } catch { watching = false; }
+      await refreshLibraryTools(folder);
+      try {
+        const session = await invoke<ReviewSession>("update_review_session", { root: folder, activePath: data[0]?.relativePath ?? null, reviewedCount: data.filter((photo) => photo.decision !== "unreviewed").length, totalCount: data.length, paused: false });
+        setReviewSession(session);
+      } catch { /* The photo review flow stays usable even if session metadata is unavailable. */ }
       setStatus(data.length ? "已載入 " + data.length + " 張影像。篩選決定會安全保存到此圖庫。" + (watching ? " 正在監看外部更新。" : " 此圖庫目前無法監看外部更新。") : "這個資料夾沒有支援的影像；請改選含照片的資料夾。");
     } catch {
       setStatus("無法開啟圖庫。請確認資料夾仍可讀取，然後再試一次。");
     }
+  }
+
+  async function runAssistance() {
+    if (!root || !photos.length) return;
+    setStatus("正在以本機技術提示分析可解碼預覽…");
+    try {
+      const result = await invoke<AssistanceResult[]>("analyze_assistance", { root, relativePaths: photos.map((photo) => photo.relativePath) });
+      setAssistance(result);
+      setStatus("已完成本機技術提示；結果只供人工參考，不會自動淘汰照片。");
+      notify("本機提示已更新");
+    } catch { setStatus("無法完成本機技術提示；部分 RAW 可能尚未有可解碼預覽。"); }
+  }
+
+  async function markBurstBest() {
+    if (!root || !currentBurst || !current) return;
+    try { await invoke("save_burst_best_frame", { root, burstId: currentBurst.group.id, relativePath: current.relativePath }); setBurstBestFrames((frames) => new Map(frames).set(currentBurst.group.id, current.relativePath)); notify("已指定為連拍最佳照片"); }
+    catch { setStatus("無法設定這張連拍最佳照片。"); }
+  }
+
+  async function restoreHistory(entry: Pick<DecisionHistoryEntry, "id" | "previousDecision" | "nextDecision" | "previousRating" | "nextRating">) {
+    if (!root || !current) return;
+    try {
+      await invoke("restore_history_entry", { root, id: entry.id });
+      setPhotos((all) => all.map((photo) => photo.relativePath === current.relativePath ? { ...photo, decision: entry.previousDecision, rating: entry.previousRating } : photo));
+      setDecisionHistory((entries) => entries.filter((item) => item.id !== entry.id));
+      setStatus("已從決策歷程還原此照片。 ");
+    } catch { setStatus("無法從決策歷程還原此照片。"); }
+  }
+
+  async function saveSnapshot() {
+    if (!root) return;
+    try { await invoke("create_review_snapshot", { root, label: "手動快照" }); setStatus("已在 .cadris/snapshots 建立可攜決定快照。"); notify("已建立快照"); }
+    catch { setStatus("無法建立決定快照。"); }
+  }
+
+  async function updateSession(paused = false) {
+    if (!root || !photos.length) return;
+    try {
+      const session = await invoke<ReviewSession>("update_review_session", { root, id: reviewSession?.id, activePath: current?.relativePath, reviewedCount: reviewed, totalCount: stats.all, paused });
+      setReviewSession(session);
+      setStatus(paused ? "工作階段已暫停，可從相同圖庫繼續。" : "工作階段已儲存，目前位置可繼續。 ");
+    } catch { setStatus("無法儲存工作階段。"); }
+  }
+
+  async function retrySync(repair = false) {
+    if (!root) return;
+    try { const next = await invoke<NativeSyncStatus>(repair ? "repair_native_sync" : "retry_native_sync", { root }); setSyncStatus(next); setStatus(next.pending ? "仍有 " + next.pending + " 項 Finder 同步等待重試。" : "Finder 同步佇列已完成。"); }
+    catch { setStatus("無法更新 Finder 同步佇列。"); }
+  }
+
+  async function updateCacheLimit(limitMb: number) {
+    if (!root) return;
+    try { const next = await invoke<CacheStatus>("set_cache_limit", { root, limitMb }); setCacheStatus(next); }
+    catch { setStatus("無法更新快取上限。"); }
+  }
+
+  async function clearDerivedCache() {
+    if (!root) return;
+    try { clearThumbnailCache(); const next = await invoke<CacheStatus>("clear_thumbnail_cache", { root }); setCacheStatus(next); setStatus("已清除衍生預覽快取；原始照片未變更。"); }
+    catch { setStatus("無法清除衍生快取。"); }
+  }
+
+  async function exportLibrary(format: "csv" | "json" | "xmp") {
+    if (!root) return;
+    const destination = format === "xmp"
+      ? await open({ directory: true, multiple: false, title: "選擇新的 XMP 輸出資料夾" })
+      : await open({ directory: false, multiple: false, title: "選擇匯出檔案位置" });
+    if (typeof destination !== "string") return;
+    try { await invoke("export_decisions", { root, request: { format, destination } }); setStatus(format === "xmp" ? "已輸出 Lightroom 可讀的 XMP sidecar；原始照片未變更。" : "已輸出非破壞式決定清單。"); }
+    catch { setStatus("無法匯出決定清單。XMP 需要選擇一個尚不存在的新資料夾。 "); }
   }
 
   useEffect(() => {
@@ -350,6 +476,15 @@ export default function App() {
     }).then((stop) => { if (disposed) stop(); else unlisten = stop; });
     return () => { disposed = true; unlisten?.(); };
   }, [root]);
+
+  useEffect(() => {
+    if (!root || !current) { setDecisionHistory([]); return; }
+    let cancelled = false;
+    void invoke<DecisionHistoryEntry[]>("decision_history", { root, relativePath: current.relativePath })
+      .then((entries) => { if (!cancelled) setDecisionHistory(entries); })
+      .catch(() => { if (!cancelled) setDecisionHistory([]); });
+    return () => { cancelled = true; };
+  }, [root, current?.relativePath, photos]);
 
   async function decision(value: Decision, fromShortcut = false) {
     const selected = photos.filter((photo) => selectedPaths.has(photo.relativePath));
@@ -436,9 +571,9 @@ export default function App() {
       notify("已從比較清單移除");
       return;
     }
-    if (comparison.length >= 4) { notify("比較最多可放入 4 張照片"); return; }
+    if (comparison.length >= 8) { notify("比較最多可放入 8 張照片"); return; }
     setComparison((items) => [...items, photo.relativePath]);
-    notify("已加入比較 · " + (comparison.length + 1) + " / 4");
+    notify("已加入比較 · " + (comparison.length + 1) + " / 8");
   }
 
   function addBurstToComparison() {
@@ -446,10 +581,17 @@ export default function App() {
     const burst = burstByPhoto.get(current.relativePath)?.group;
     if (!burst) { notify("這張照片不在自動偵測的連拍組中"); return; }
     const ordered = [current, ...burst.photos.filter((photo) => photo.relativePath !== current.relativePath)];
-    const available = ordered.filter((photo) => !comparison.includes(photo.relativePath)).slice(0, Math.max(0, 4 - comparison.length));
+    const available = ordered.filter((photo) => !comparison.includes(photo.relativePath)).slice(0, Math.max(0, 8 - comparison.length));
     if (!available.length) { notify("這組連拍已在比較清單中"); return; }
     setComparison((items) => [...items, ...available.map((photo) => photo.relativePath)]);
     notify("已加入 " + available.length + " 張連拍照片比較");
+  }
+
+  function addSelectionToComparison() {
+    const paths = selection.filter((path) => !comparison.includes(path)).slice(0, Math.max(0, 8 - comparison.length));
+    if (!paths.length) { notify("已選照片都在比較清單，或已達 8 張上限"); return; }
+    setComparison((items) => [...items, ...paths]);
+    notify("已加入 " + paths.length + " 張選取照片比較");
   }
 
   function openComparison() {
@@ -551,6 +693,19 @@ export default function App() {
     setShortcutStatus("已還原 Lightroom CC 預設快捷鍵。");
   }
 
+  function applySmartCollection(value: string) {
+    if (value === "unreviewed" || value === "keep" || value === "reject") {
+      setFilter(value); setAdvancedFilter(emptyAdvancedFilter); return;
+    }
+    setFilter("all");
+    setAdvancedFilter({ ...emptyAdvancedFilter,
+      burstOnly: value === "burst",
+      pairedOnly: value === "pair",
+      minRating: value === "rated" ? "1" : "",
+      assistance: value === "assistance" ? "blur" : "all",
+    });
+  }
+
   const move = (by: number) => {
     const nextIndex = Math.max(0, Math.min(libraryItems.length - 1, active + by));
     const nextItem = libraryItems[nextIndex];
@@ -564,6 +719,21 @@ export default function App() {
   useEffect(() => () => { if (ratioFrameRef.current !== null) window.cancelAnimationFrame(ratioFrameRef.current); }, []);
   useEffect(() => { window.localStorage.setItem("cadris.shortcuts", JSON.stringify(shortcuts)); }, [shortcuts]);
   useEffect(() => { window.localStorage.setItem("cadris.theme", theme); }, [theme]);
+  useEffect(() => { window.localStorage.setItem("cadris.burst-gap-ms", String(burstGapMs)); }, [burstGapMs]);
+  useEffect(() => { window.localStorage.setItem("cadris.preview-profile", previewProfile); clearThumbnailCache(); }, [previewProfile]);
+  useEffect(() => { window.localStorage.setItem("cadris.preload-count", String(preloadCount)); }, [preloadCount]);
+  useEffect(() => { window.localStorage.setItem("cadris.raw-cache-only", String(rawCacheOnly)); clearThumbnailCache(); }, [rawCacheOnly]);
+  useEffect(() => {
+    if (!root || !photos.length || !reviewSession) return;
+    const timer = window.setTimeout(() => void updateSession(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [root, photos.length, current?.relativePath, reviewed]);
+  useEffect(() => {
+    if (!root || !preloadCount || !libraryItems.length) return;
+    const targets = libraryItems.slice(active + 1, active + 1 + preloadCount).map((item) => item.primary.relativePath);
+    const timer = window.setTimeout(() => { targets.forEach((relativePath) => { void invoke("thumbnail_for", { root, relativePath, variant: "grid", profile: previewProfile, cacheOnly: false }); }); }, 180);
+    return () => window.clearTimeout(timer);
+  }, [root, libraryItems, active, preloadCount, previewProfile]);
   useEffect(() => { setActive(0); setSelection([]); setSelectionAnchor(null); }, [filter, search, sortBy]);
   useEffect(() => { setActive((index) => Math.max(0, Math.min(index, Math.max(libraryItems.length - 1, 0)))); }, [libraryItems.length]);
   useEffect(() => { resetLoupe(); }, [current?.relativePath]);
@@ -624,14 +794,15 @@ export default function App() {
     <header><div className="brand" aria-label="Cadris"><b aria-hidden="true">C</b></div><button type="button" className="primary icon-button" onClick={choose} aria-label="開啟照片資料夾" title="開啟照片資料夾"><Icon name="folder" /></button><span title={root}>{root ? root.split(/[\\/]/).pop() : "未開啟圖庫"}</span>{root && externalChanges > 0 && <button className="library-refresh icon-button" type="button" onClick={() => void scan(root)} aria-label={externalChanges + " 項外部更新，重新整理"} title="重新整理"><Icon name="refresh" /><span>{externalChanges}</span></button>}<button type="button" className="settings-button icon-button" onClick={openSettings} aria-label="設定" title="設定"><Icon name="settings" /></button></header>
     <nav aria-label="圖庫工具列">
       <div className="filter-group" aria-label="篩選照片">{(["all", "unreviewed", "keep", "reject"] as const).map((nextFilter) => <button key={nextFilter} type="button" aria-pressed={filter === nextFilter} className={filter === nextFilter ? "active" : ""} onClick={() => setFilter(nextFilter)}>{nextFilter === "all" ? "全部 " + stats.all : labels[nextFilter] + " " + stats[nextFilter]}</button>)}</div>
-      <label className="sr-only" htmlFor="photo-search">搜尋</label><input id="photo-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜尋" />
+      <button type="button" className={showAdvancedFilters ? "active icon-button" : "icon-button"} aria-pressed={showAdvancedFilters} onClick={() => setShowAdvancedFilters((shown) => !shown)} aria-label="進階篩選" title="進階篩選"><Icon name="filter" /></button><label className="sr-only" htmlFor="photo-search">搜尋</label><input id="photo-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜尋" />
       <label className="sort-control"><span className="sr-only">排序</span><select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortOption)}><option value="name-asc">檔名 A → Z</option><option value="name-desc">檔名 Z → A</option><option value="captured-newest">時間 ↓</option><option value="captured-oldest">時間 ↑</option><option value="rating-desc">星等 ↓</option></select></label>
     </nav>
-    {settings ? <SettingsPage theme={theme} setTheme={setTheme} gridSize={gridSize} setGridSize={setGridSize} autoAdvance={autoAdvance} setAutoAdvance={setAutoAdvance} shortcuts={shortcuts} editingShortcut={editingShortcut} shortcutStatus={shortcutStatus} onClose={closeSettings} onStartShortcutEdit={startShortcutEdit} onRestoreShortcuts={restoreShortcuts} /> : !photos.length ? <section className="empty"><h1>選擇照片資料夾</h1><button type="button" className="primary icon-button" onClick={choose} aria-label="選擇照片資料夾" title="選擇照片資料夾"><Icon name="folder" /></button><p><kbd>Z</kbd>　<kbd>X</kbd>　<kbd>U</kbd>　<kbd>0–5</kbd>　<kbd>Space</kbd></p></section> : <>
-      {view === "grid" ? <GalleryView root={root} gridMode={gridMode} libraryItems={libraryItems} gridViewportRef={gridViewportRef} gridBounds={gridBounds} rowCount={rowCount} cardHeight={cardHeight} firstRow={firstRow} columnCount={columnCount} virtualStart={virtualStart} virtualItems={virtualItems} galleryHeight={galleryHeight} galleryRows={galleryRows} firstGalleryRow={firstGalleryRow} lastGalleryRow={lastGalleryRow} burstByPhoto={burstByPhoto} selectedPaths={selectedPaths} comparison={comparison} active={active} onFocusPhoto={focusPhoto} onSelectPhoto={selectPhoto} onOpenLoupe={() => setView("loupe")} onScroll={handleGridScroll} onRememberRatio={rememberRatio} /> : view === "loupe" && current ? <LoupeView root={root} current={current} currentItem={currentItem} currentBurst={currentBurst} scale={loupeScale} pan={loupePan} stageRef={loupeStageRef} onStartPan={startLoupePan} onMovePan={moveLoupePan} onEndPan={endLoupePan} onScale={updateLoupeScale} onReset={resetLoupe} onRememberRatio={rememberRatio} onAddBurstToComparison={addBurstToComparison} /> : view === "compare" && comparisonPhotos.length >= 2 ? <CompareView root={root} photos={comparisonPhotos} zoom={compareZoom} pan={comparePan} onToggleZoom={() => { setCompareZoom((value) => !value); setComparePan({ x: 0, y: 0 }); }} onResetPan={() => setComparePan({ x: 0, y: 0 })} onReturnToGrid={() => setView("grid")} onRemove={toggleComparison} onStartPan={startComparePan} onMovePan={moveComparePan} onEndPan={endComparePan} /> : <section className="empty"><h1>{view === "compare" ? "至少加入兩張照片才能比較" : "沒有符合篩選的照片"}</h1><p>{view === "compare" ? "回到圖庫，以 C 將照片放入比較清單。" : "調整篩選條件或搜尋文字，繼續檢視圖庫。"}</p></section>}
+    {showAdvancedFilters && <AdvancedFilters value={advancedFilter} photos={photos} onChange={setAdvancedFilter} onReset={() => setAdvancedFilter(emptyAdvancedFilter)} onSmartCollection={applySmartCollection} />}
+    {settings ? <SettingsPage root={root} theme={theme} setTheme={setTheme} gridSize={gridSize} setGridSize={setGridSize} autoAdvance={autoAdvance} setAutoAdvance={setAutoAdvance} shortcuts={shortcuts} editingShortcut={editingShortcut} shortcutStatus={shortcutStatus} onClose={closeSettings} onStartShortcutEdit={startShortcutEdit} onRestoreShortcuts={restoreShortcuts} burstGapMs={burstGapMs} setBurstGapMs={setBurstGapMs} previewProfile={previewProfile} setPreviewProfile={setPreviewProfile} preloadCount={preloadCount} setPreloadCount={setPreloadCount} rawCacheOnly={rawCacheOnly} setRawCacheOnly={setRawCacheOnly} cacheStatus={cacheStatus} syncStatus={syncStatus} reviewSession={reviewSession} onUpdateCacheLimit={(limit) => void updateCacheLimit(limit)} onClearDerivedCache={() => void clearDerivedCache()} onRetrySync={(repair) => void retrySync(repair)} onUpdateSession={(paused) => void updateSession(paused)} onSnapshot={() => void saveSnapshot()} onRunAssistance={() => void runAssistance()} onExport={(format) => void exportLibrary(format)} /> : !photos.length ? <section className="empty"><h1>選擇照片資料夾</h1><button type="button" className="primary icon-button" onClick={choose} aria-label="選擇照片資料夾" title="選擇照片資料夾"><Icon name="folder" /></button><p><kbd>Z</kbd>　<kbd>X</kbd>　<kbd>U</kbd>　<kbd>0–5</kbd>　<kbd>Space</kbd></p></section> : <>
+      {view === "grid" ? <GalleryView root={root} gridMode={gridMode} libraryItems={libraryItems} gridViewportRef={gridViewportRef} gridBounds={gridBounds} rowCount={rowCount} cardHeight={cardHeight} firstRow={firstRow} columnCount={columnCount} virtualStart={virtualStart} virtualItems={virtualItems} galleryHeight={galleryHeight} galleryRows={galleryRows} firstGalleryRow={firstGalleryRow} lastGalleryRow={lastGalleryRow} burstByPhoto={burstByPhoto} burstBestFrames={burstBestFrames} selectedPaths={selectedPaths} comparison={comparison} active={active} onFocusPhoto={focusPhoto} onSelectPhoto={selectPhoto} onOpenLoupe={() => setView("loupe")} onScroll={handleGridScroll} onRememberRatio={rememberRatio} /> : view === "loupe" && current ? <LoupeView root={root} current={current} currentItem={currentItem} currentBurst={currentBurst} isBurstBest={Boolean(currentBurst && burstBestFrames.get(currentBurst.group.id) === current.relativePath)} history={decisionHistory} scale={loupeScale} pan={loupePan} stageRef={loupeStageRef} onStartPan={startLoupePan} onMovePan={moveLoupePan} onEndPan={endLoupePan} onScale={updateLoupeScale} onReset={resetLoupe} onRememberRatio={rememberRatio} onAddBurstToComparison={addBurstToComparison} onMarkBurstBest={() => void markBurstBest()} onRestoreHistory={restoreHistory} /> : view === "compare" && comparisonPhotos.length >= 2 ? <CompareView root={root} photos={comparisonPhotos} zoom={compareZoom} pan={comparePan} onToggleZoom={() => { setCompareZoom((value) => !value); setComparePan({ x: 0, y: 0 }); }} onResetPan={() => setComparePan({ x: 0, y: 0 })} onSetRegion={(region) => { const amount = 180; setCompareZoom(true); setComparePan(region === "center" ? { x: 0, y: 0 } : { x: region.includes("right") ? -amount : amount, y: region.includes("bottom") ? -amount : amount }); }} onReturnToGrid={() => setView("grid")} onRemove={toggleComparison} onStartPan={startComparePan} onMovePan={moveComparePan} onEndPan={endComparePan} /> : <section className="empty"><h1>{view === "compare" ? "至少加入兩張照片才能比較" : "沒有符合篩選的照片"}</h1><p>{view === "compare" ? "回到圖庫，以 C 將照片放入比較清單。" : "調整篩選條件或搜尋文字，繼續檢視圖庫。"}</p></section>}
       <section className="bottom-dock" aria-label="檢視與編輯控制">
         <div className="dock-view" aria-label="檢視方式"><button type="button" aria-pressed={view === "grid"} className={(view === "grid" ? "active " : "") + "icon-button"} onClick={() => setView("grid")} aria-label="圖庫" title="圖庫"><Icon name="grid" /></button><button type="button" aria-pressed={view === "loupe"} className={(view === "loupe" ? "active " : "") + "icon-button"} onClick={() => current && setView("loupe")} aria-label="單張" title="單張"><Icon name="single" /></button><button type="button" aria-pressed={view === "compare"} className={(view === "compare" ? "active " : "") + "icon-button has-count"} onClick={openComparison} aria-label={"比較 " + comparison.length + " 張"} title="比較"><Icon name="compare" /><span>{comparison.length}</span></button>{view === "grid" && <><button type="button" aria-pressed={gridMode === "square"} className={(gridMode === "square" ? "active " : "") + "icon-button"} onClick={() => setGridMode("square")} aria-label="正方形圖庫" title="正方形圖庫"><Icon name="square" /></button><button type="button" aria-pressed={gridMode === "photo"} className={(gridMode === "photo" ? "active " : "") + "icon-button"} onClick={() => setGridMode("photo")} aria-label="依相片比例" title="依相片比例"><Icon name="flow" /></button></>}</div>
-        <div className="dock-actions"><div className="decision-controls" aria-label="目前選取照片的旗標"><button type="button" className={current?.decision === "keep" ? "keep selected" : "keep"} aria-pressed={current?.decision === "keep"} disabled={saving} onClick={() => void decision("keep")} aria-label="保留" title="保留 (Z)">Z</button><button type="button" className={current?.decision === "reject" ? "reject selected" : "reject"} aria-pressed={current?.decision === "reject"} disabled={saving} onClick={() => void decision("reject")} aria-label="淘汰" title="淘汰 (X)">X</button><button type="button" className={current?.decision === "unreviewed" ? "selected" : ""} aria-pressed={current?.decision === "unreviewed"} disabled={saving} onClick={() => void decision("unreviewed")} aria-label="清除旗標" title="清除旗標 (U)">U</button></div><div className="rating-controls" aria-label="目前選取照片的星等">{[0, 1, 2, 3, 4, 5].map((value) => <button key={value} type="button" aria-pressed={current?.rating === value} disabled={saving} onClick={() => void rating(value)} aria-label={value ? value + " 星" : "清除星等"} title={value ? value + " 星" : "清除星等"}>{value ? "★" + value : "0"}</button>)}</div><div className="compare-controls" aria-label="比較清單"><button type="button" className={current && comparison.includes(current.relativePath) ? "selected" : ""} aria-pressed={Boolean(current && comparison.includes(current.relativePath))} onClick={() => toggleComparison()} aria-label="加入或移出比較" title="加入或移出比較 (C)">C</button><button type="button" disabled={comparison.length < 2} onClick={openComparison} aria-label={"比較 " + comparison.length + " 張"} title="比較"><Icon name="compare" /><span>{comparison.length}</span></button></div></div>
+        <div className="dock-actions"><div className="decision-controls" aria-label="目前選取照片的旗標"><button type="button" className={current?.decision === "keep" ? "keep selected" : "keep"} aria-pressed={current?.decision === "keep"} disabled={saving} onClick={() => void decision("keep")} aria-label="保留" title="保留 (Z)">Z</button><button type="button" className={current?.decision === "reject" ? "reject selected" : "reject"} aria-pressed={current?.decision === "reject"} disabled={saving} onClick={() => void decision("reject")} aria-label="淘汰" title="淘汰 (X)">X</button><button type="button" className={current?.decision === "unreviewed" ? "selected" : ""} aria-pressed={current?.decision === "unreviewed"} disabled={saving} onClick={() => void decision("unreviewed")} aria-label="清除旗標" title="清除旗標 (U)">U</button></div><div className="rating-controls" aria-label="目前選取照片的星等">{[0, 1, 2, 3, 4, 5].map((value) => <button key={value} type="button" aria-pressed={current?.rating === value} disabled={saving} onClick={() => void rating(value)} aria-label={value ? value + " 星" : "清除星等"} title={value ? value + " 星" : "清除星等"}>{value ? "★" + value : "0"}</button>)}</div><div className="compare-controls" aria-label="比較清單"><button type="button" className={current && comparison.includes(current.relativePath) ? "selected" : ""} aria-pressed={Boolean(current && comparison.includes(current.relativePath))} onClick={() => toggleComparison()} aria-label="加入或移出比較" title="加入或移出比較 (C)">C</button>{selection.length > 1 && <button type="button" onClick={addSelectionToComparison} aria-label="將選取照片加入比較" title="加入已選照片">＋選</button>}<button type="button" disabled={comparison.length < 2} onClick={openComparison} aria-label={"比較 " + comparison.length + " 張"} title="比較"><Icon name="compare" /><span>{comparison.length}</span></button></div></div>
         {view === "grid" && <label className="dock-zoom">縮放 <input aria-label="圖庫縮圖尺寸" type="range" min="120" max="340" step="10" value={gridSize} onChange={(event) => setGridSize(Number(event.target.value))} /></label>}
       </section>
     </>}

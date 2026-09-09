@@ -7,21 +7,23 @@ type CachedPhotoImageProps = Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> & 
 
 export function CachedPhotoImage({ root, photo, className, onError, ...props }: CachedPhotoImageProps) {
   const variant: ThumbnailVariant = className === "loupe-image" ? "original" : props.style ? "detail" : "grid";
-  const cacheKey = `${root}\u0000${photo.relativePath}\u0000${photo.size}\u0000${photo.modifiedAt}`;
-  const requestKey = `${variant}\u0000${cacheKey}`;
+  const profile = window.localStorage.getItem("cadris.preview-profile") === "speed" ? "speed" : window.localStorage.getItem("cadris.preview-profile") === "quality" ? "quality" : "balanced";
+  const cacheOnly = variant === "original" && window.localStorage.getItem("cadris.raw-cache-only") === "true";
+  const cacheKey = `${root}\u0000${photo.relativePath}\u0000${photo.size}\u0000${photo.modifiedAt}\u0000${profile}\u0000${cacheOnly}`;
+  const requestKey = `${variant}\u0000${profile}\u0000${cacheOnly}\u0000${cacheKey}`;
   const [source, setSource] = useState<string | null>(() => readThumbnailSource(variant, cacheKey) ?? null);
   useEffect(() => {
     let mounted = true;
     const cached = readThumbnailSource(variant, cacheKey);
     if (cached) { setSource(cached); return () => { mounted = false; }; }
     setSource(null);
-    const request = acquireThumbnail(requestKey, () => invoke<string | null>("thumbnail_for", { root, relativePath: photo.relativePath, variant }).then((thumbnailSource) => thumbnailSource ?? ""));
+    const request = acquireThumbnail(requestKey, () => invoke<string | null>("thumbnail_for", { root, relativePath: photo.relativePath, variant, profile, cacheOnly }).then((thumbnailSource) => thumbnailSource ?? ""));
     void request.promise.then((nextSource) => {
       rememberThumbnailSource(variant, cacheKey, nextSource);
       if (mounted) setSource(nextSource);
     });
     return () => { mounted = false; request.release(); };
-  }, [cacheKey, photo.relativePath, requestKey, root, variant]);
+  }, [cacheKey, cacheOnly, photo.relativePath, profile, requestKey, root, variant]);
 
   function handleError(event: SyntheticEvent<HTMLImageElement, Event>) {
     rememberThumbnailSource(variant, cacheKey, "");

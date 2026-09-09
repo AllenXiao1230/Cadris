@@ -3,7 +3,7 @@ use image::ImageDecoder;
 use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, BTreeSet, HashMap, HashSet, VecDeque},
     fs,
@@ -27,7 +27,7 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 ];
 const GRID_THUMBNAIL_EDGE: u32 = 560;
 const DETAIL_THUMBNAIL_EDGE: u32 = 1600;
-const MANIFEST_SCHEMA_VERSION: u32 = 4;
+const MANIFEST_SCHEMA_VERSION: u32 = 7;
 const THUMBNAIL_CACHE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const PREVIEW_SOURCE_LIMIT: usize = 256;
 const SCAN_BATCH_SIZE: usize = 48;
@@ -66,19 +66,27 @@ impl ThumbnailVariant {
         }
     }
 
-    fn edge(self) -> Option<u32> {
-        match self {
-            Self::Grid => Some(GRID_THUMBNAIL_EDGE),
-            Self::Detail => Some(DETAIL_THUMBNAIL_EDGE),
-            Self::Original => None,
+    fn edge(self, profile: &str) -> Option<u32> {
+        match (self, profile) {
+            (Self::Grid, "speed") => Some(360),
+            (Self::Grid, "quality") => Some(760),
+            (Self::Grid, _) => Some(GRID_THUMBNAIL_EDGE),
+            (Self::Detail, "speed") => Some(1100),
+            (Self::Detail, "quality") => Some(2400),
+            (Self::Detail, _) => Some(DETAIL_THUMBNAIL_EDGE),
+            (Self::Original, _) => None,
         }
     }
 
-    fn jpeg_quality(self) -> u8 {
-        match self {
-            Self::Grid => 76,
-            Self::Detail => 84,
-            Self::Original => 96,
+    fn jpeg_quality(self, profile: &str) -> u8 {
+        match (self, profile) {
+            (Self::Grid, "speed") => 70,
+            (Self::Grid, "quality") => 84,
+            (Self::Grid, _) => 76,
+            (Self::Detail, "speed") => 78,
+            (Self::Detail, "quality") => 92,
+            (Self::Detail, _) => 84,
+            (Self::Original, _) => 96,
         }
     }
 
@@ -104,6 +112,8 @@ struct Photo {
     lens: Option<String>,
     captured_at: Option<String>,
     exposure: Option<String>,
+    aperture: Option<String>,
+    iso: Option<String>,
     focal_length: Option<String>,
     exposure_compensation: Option<String>,
     dimensions: Option<String>,
@@ -125,6 +135,90 @@ struct DecisionSaveResult {
 struct BatchDecisionSaveResult {
     native_synced: usize,
     pending_native_sync: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DecisionHistoryEntry {
+    id: i64,
+    batch_id: String,
+    relative_path: String,
+    previous_decision: String,
+    next_decision: String,
+    previous_rating: u8,
+    next_rating: u8,
+    changed_at: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewSession {
+    id: String,
+    started_at: i64,
+    updated_at: i64,
+    paused_at: Option<i64>,
+    active_path: Option<String>,
+    reviewed_count: usize,
+    total_count: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncIssue {
+    relative_path: String,
+    decision: String,
+    queued_at: i64,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSyncStatus {
+    available: bool,
+    pending: usize,
+    issues: Vec<SyncIssue>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheStatus {
+    bytes: u64,
+    files: usize,
+    limit_mb: u64,
+    failures: Vec<PreviewFailure>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewFailure {
+    relative_path: String,
+    error: String,
+    updated_at: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistanceResult {
+    relative_path: String,
+    blur_hint: bool,
+    exposure_hint: Option<String>,
+    similar_group: Option<String>,
+    eye_hint: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BurstBestFrame {
+    burst_id: String,
+    relative_path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    format: String,
+    destination: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -171,6 +265,8 @@ struct IndexedPhoto {
     lens: Option<String>,
     captured_at: Option<String>,
     exposure: Option<String>,
+    aperture: Option<String>,
+    iso: Option<String>,
     focal_length: Option<String>,
     exposure_compensation: Option<String>,
     dimensions: Option<String>,
@@ -239,6 +335,8 @@ struct PhotoExif {
     lens: Option<String>,
     captured_at: Option<String>,
     exposure: Option<String>,
+    aperture: Option<String>,
+    iso: Option<String>,
     focal_length: Option<String>,
     exposure_compensation: Option<String>,
     dimensions: Option<String>,
@@ -288,8 +386,7 @@ fn read_photo_metadata(path: &Path) -> PhotoExif {
             exif::Tag::ISOSpeed,
             exif::Tag::RecommendedExposureIndex,
         ],
-    )
-    .map(|value| format!("ISO {value}"));
+    );
     let focal_length = join_metadata_values(
         vec![
             metadata_value(&exif, exif::Tag::FocalLength),
@@ -331,9 +428,9 @@ fn read_photo_metadata(path: &Path) -> PhotoExif {
         ),
         exposure: join_metadata_values(
             vec![
-                aperture,
+                aperture.clone(),
                 shutter,
-                iso,
+                iso.clone().map(|value| format!("ISO {value}")),
                 focal_length.clone().map(|value| format!("焦段 {value}")),
                 exposure_compensation
                     .clone()
@@ -341,6 +438,8 @@ fn read_photo_metadata(path: &Path) -> PhotoExif {
             ],
             " · ",
         ),
+        aperture,
+        iso,
         focal_length,
         exposure_compensation,
         dimensions,
@@ -430,6 +529,8 @@ fn open_manifest(root: &Path) -> Result<Connection, String> {
                 lens TEXT,
                 captured_at TEXT,
                 exposure TEXT,
+                aperture TEXT,
+                iso TEXT,
                 focal_length TEXT,
                 exposure_compensation TEXT,
                 dimensions TEXT,
@@ -440,6 +541,46 @@ fn open_manifest(root: &Path) -> Result<Connection, String> {
             );
             CREATE INDEX IF NOT EXISTS library_photos_captured_at ON library_photos(captured_at);
             CREATE INDEX IF NOT EXISTS library_photos_modified_at ON library_photos(modified_at);
+            CREATE TABLE IF NOT EXISTS decision_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                previous_decision TEXT NOT NULL,
+                next_decision TEXT NOT NULL,
+                previous_rating INTEGER NOT NULL,
+                next_rating INTEGER NOT NULL,
+                changed_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS decision_history_path ON decision_history(relative_path, id DESC);
+            CREATE TABLE IF NOT EXISTS review_sessions (
+                id TEXT PRIMARY KEY NOT NULL,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                paused_at INTEGER,
+                active_path TEXT,
+                reviewed_count INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS review_snapshots (
+                id TEXT PRIMARY KEY NOT NULL,
+                label TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                state_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS burst_best_frames (
+                burst_id TEXT PRIMARY KEY NOT NULL,
+                relative_path TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS preview_failures (
+                relative_path TEXT PRIMARY KEY NOT NULL,
+                error TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS library_settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
             CREATE VIRTUAL TABLE IF NOT EXISTS photo_search USING fts5(
                 relative_path UNINDEXED,
                 name,
@@ -468,6 +609,10 @@ fn open_manifest(root: &Path) -> Result<Connection, String> {
                 [],
             )
             .map_err(|error| format!("無法建立圖庫識別索引：{error}"))?;
+    }
+    if current_version < 5 {
+        add_manifest_column(&connection, "aperture", "TEXT")?;
+        add_manifest_column(&connection, "iso", "TEXT")?;
     }
     if current_version < MANIFEST_SCHEMA_VERSION {
         connection
@@ -582,7 +727,7 @@ fn read_indexed_photos(connection: &Connection) -> Result<HashMap<String, Indexe
     let mut statement = connection
         .prepare(
             "SELECT relative_path, name, extension, size, modified_at, camera, lens, captured_at,
-                    exposure, focal_length, exposure_compensation, dimensions, shooting, orientation, fingerprint
+                    exposure, aperture, iso, focal_length, exposure_compensation, dimensions, shooting, orientation, fingerprint
              FROM library_photos",
         )
         .map_err(|error| format!("無法讀取既有圖庫索引：{error}"))?;
@@ -599,12 +744,14 @@ fn read_indexed_photos(connection: &Connection) -> Result<HashMap<String, Indexe
                     lens: row.get(6)?,
                     captured_at: row.get(7)?,
                     exposure: row.get(8)?,
-                    focal_length: row.get(9)?,
-                    exposure_compensation: row.get(10)?,
-                    dimensions: row.get(11)?,
-                    shooting: row.get(12)?,
-                    orientation: row.get(13)?,
-                    fingerprint: row.get(14)?,
+                    aperture: row.get(9)?,
+                    iso: row.get(10)?,
+                    focal_length: row.get(11)?,
+                    exposure_compensation: row.get(12)?,
+                    dimensions: row.get(13)?,
+                    shooting: row.get(14)?,
+                    orientation: row.get(15)?,
+                    fingerprint: row.get(16)?,
                 },
             ))
         })
@@ -622,6 +769,8 @@ fn photo_matches_index(photo: &Photo, indexed: &IndexedPhoto, fingerprint: &str)
         && photo.lens == indexed.lens
         && photo.captured_at == indexed.captured_at
         && photo.exposure == indexed.exposure
+        && photo.aperture == indexed.aperture
+        && photo.iso == indexed.iso
         && photo.focal_length == indexed.focal_length
         && photo.exposure_compensation == indexed.exposure_compensation
         && photo.dimensions == indexed.dimensions
@@ -673,13 +822,13 @@ fn index_photos(
         transaction
             .execute(
                 "INSERT INTO library_photos(
-                    relative_path, name, extension, size, modified_at, camera, lens, captured_at, exposure,
+                    relative_path, name, extension, size, modified_at, camera, lens, captured_at, exposure, aperture, iso,
                     focal_length, exposure_compensation, dimensions, shooting, orientation, fingerprint, indexed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, unixepoch())
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, unixepoch())
                 ON CONFLICT(relative_path) DO UPDATE SET
                     name = excluded.name, extension = excluded.extension, size = excluded.size,
                     modified_at = excluded.modified_at, camera = excluded.camera, lens = excluded.lens,
-                    captured_at = excluded.captured_at, exposure = excluded.exposure,
+                    captured_at = excluded.captured_at, exposure = excluded.exposure, aperture = excluded.aperture, iso = excluded.iso,
                     focal_length = excluded.focal_length, exposure_compensation = excluded.exposure_compensation,
                     dimensions = excluded.dimensions, shooting = excluded.shooting,
                     orientation = excluded.orientation, fingerprint = excluded.fingerprint,
@@ -694,6 +843,8 @@ fn index_photos(
                     &photo.lens,
                     &photo.captured_at,
                     &photo.exposure,
+                    &photo.aperture,
+                    &photo.iso,
                     &photo.focal_length,
                     &photo.exposure_compensation,
                     &photo.dimensions,
@@ -756,12 +907,14 @@ fn thumbnail_path(
     size: u64,
     modified_at: u64,
     variant: ThumbnailVariant,
+    profile: &str,
 ) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     relative_path.hash(&mut hasher);
     size.hash(&mut hasher);
     modified_at.hash(&mut hasher);
     variant.cache_key().hash(&mut hasher);
+    profile.hash(&mut hasher);
     root.join(".cadris")
         .join("thumbnails")
         .join(format!("{:016x}.jpg", hasher.finish()))
@@ -782,11 +935,12 @@ fn thumbnail_dimensions(width: u32, height: u32, edge: u32) -> (u32, u32) {
 fn resize_for_thumbnail(
     decoded: image::DynamicImage,
     variant: ThumbnailVariant,
+    profile: &str,
 ) -> Result<image::DynamicImage, String> {
     let rgba = decoded.to_rgba8();
     let (width, height) = rgba.dimensions();
     let (thumbnail_width, thumbnail_height) = variant
-        .edge()
+        .edge(profile)
         .map(|edge| thumbnail_dimensions(width, height, edge))
         .unwrap_or((width, height));
     if (width, height) == (thumbnail_width, thumbnail_height) {
@@ -820,11 +974,12 @@ fn write_jpeg_thumbnail(
     decoded: image::DynamicImage,
     temporary_path: &Path,
     variant: ThumbnailVariant,
+    profile: &str,
 ) -> Result<bool, String> {
-    let thumbnail = resize_for_thumbnail(decoded, variant)?;
+    let thumbnail = resize_for_thumbnail(decoded, variant, profile)?;
     let file =
         fs::File::create(temporary_path).map_err(|error| format!("無法建立縮圖：{error}"))?;
-    image::codecs::jpeg::JpegEncoder::new_with_quality(file, variant.jpeg_quality())
+    image::codecs::jpeg::JpegEncoder::new_with_quality(file, variant.jpeg_quality(profile))
         .encode_image(&thumbnail)
         .map_err(|error| format!("無法寫入縮圖：{error}"))?;
     Ok(true)
@@ -834,6 +989,7 @@ fn create_rust_thumbnail(
     photo_path: &Path,
     temporary_path: &Path,
     variant: ThumbnailVariant,
+    profile: &str,
 ) -> Result<bool, String> {
     let Ok(reader) = image::ImageReader::open(photo_path) else {
         return Ok(false);
@@ -851,7 +1007,7 @@ fn create_rust_thumbnail(
         return Ok(false);
     };
     decoded.apply_orientation(orientation);
-    write_jpeg_thumbnail(decoded, temporary_path, variant)
+    write_jpeg_thumbnail(decoded, temporary_path, variant, profile)
 }
 
 #[cfg(target_os = "macos")]
@@ -859,10 +1015,11 @@ fn create_platform_thumbnail(
     photo_path: &Path,
     temporary_path: &Path,
     variant: ThumbnailVariant,
+    profile: &str,
 ) -> Result<bool, String> {
     let mut command = Command::new("/usr/bin/sips");
     command.args(["-s", "format", "jpeg"]);
-    if let Some(edge) = variant.edge() {
+    if let Some(edge) = variant.edge(profile) {
         command.args(["-Z", &edge.to_string()]);
     }
     let output = command
@@ -879,7 +1036,12 @@ fn create_platform_thumbnail(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn create_platform_thumbnail(_: &Path, _: &Path, _: ThumbnailVariant) -> Result<bool, String> {
+fn create_platform_thumbnail(
+    _: &Path,
+    _: &Path,
+    _: ThumbnailVariant,
+    _: &str,
+) -> Result<bool, String> {
     Ok(false)
 }
 
@@ -966,7 +1128,11 @@ fn cache_directory(root: &Path) -> PathBuf {
 
 fn prune_thumbnail_cache(root: &Path, protected: Option<&Path>) {
     let cache = cache_directory(root);
-    prune_thumbnail_cache_to_limit(&cache, THUMBNAIL_CACHE_LIMIT_BYTES, protected);
+    let limit = open_manifest(root)
+        .ok()
+        .map(|connection| configured_cache_limit_mb(&connection) * 1024 * 1024)
+        .unwrap_or(THUMBNAIL_CACHE_LIMIT_BYTES);
+    prune_thumbnail_cache_to_limit(&cache, limit, protected);
 }
 
 fn prune_thumbnail_cache_to_limit(cache: &Path, limit_bytes: u64, protected: Option<&Path>) {
@@ -1005,6 +1171,8 @@ fn build_thumbnail(
     root: &Path,
     relative_path: &str,
     variant: ThumbnailVariant,
+    profile: &str,
+    cache_only: bool,
 ) -> Result<Option<String>, String> {
     let photo_path = library_photo_path(root, relative_path)?;
     let metadata =
@@ -1015,6 +1183,7 @@ fn build_thumbnail(
         metadata.len(),
         modified_at(&metadata),
         variant,
+        profile,
     );
     if valid_thumbnail_cache(&cached_path) {
         if THUMBNAIL_PRUNE_SEQUENCE
@@ -1028,13 +1197,16 @@ fn build_thumbnail(
     if cached_path.exists() {
         let _ = fs::remove_file(&cached_path);
     }
+    if cache_only {
+        return Ok(None);
+    }
     let parent = cached_path
         .parent()
         .ok_or_else(|| "無法建立縮圖快取位置".to_string())?;
     fs::create_dir_all(parent).map_err(|error| format!("無法建立縮圖快取：{error}"))?;
     let temporary_path = temporary_thumbnail_path(&cached_path);
-    let created = create_rust_thumbnail(&photo_path, &temporary_path, variant)?
-        || create_platform_thumbnail(&photo_path, &temporary_path, variant)?;
+    let created = create_rust_thumbnail(&photo_path, &temporary_path, variant, profile)?
+        || create_platform_thumbnail(&photo_path, &temporary_path, variant, profile)?;
     if !created {
         return Ok(None);
     }
@@ -1049,23 +1221,67 @@ fn build_thumbnail(
     Ok(Some(cached_path.to_string_lossy().into()))
 }
 
+fn record_preview_failure(root: &Path, relative_path: &str, error: &str) {
+    if let Ok(connection) = open_manifest(root) {
+        let _ = connection.execute(
+            "INSERT INTO preview_failures(relative_path, error, updated_at) VALUES (?1, ?2, unixepoch())
+             ON CONFLICT(relative_path) DO UPDATE SET error = excluded.error, updated_at = excluded.updated_at",
+            params![relative_path, error],
+        );
+    }
+}
+
+fn clear_preview_failure(root: &Path, relative_path: &str) {
+    if let Ok(connection) = open_manifest(root) {
+        let _ = connection.execute(
+            "DELETE FROM preview_failures WHERE relative_path = ?1",
+            [relative_path],
+        );
+    }
+}
+
 #[tauri::command]
 fn thumbnail_for(
     preview_state: State<'_, PreviewState>,
     root: String,
     relative_path: String,
     variant: String,
+    profile: Option<String>,
+    cache_only: Option<bool>,
 ) -> Result<Option<String>, String> {
     let root = PathBuf::from(root);
     let variant = ThumbnailVariant::parse(&variant)?;
+    let profile = profile
+        .as_deref()
+        .filter(|value| matches!(*value, "speed" | "balanced" | "quality"))
+        .unwrap_or("balanced");
     THUMBNAIL_POOL.install(|| {
         if matches!(variant, ThumbnailVariant::Original) {
             if let Some(source) = original_image_source(&root, &relative_path)? {
                 return register_preview_source(&preview_state, source).map(Some);
             }
         }
-        let Some(path) = build_thumbnail(&root, &relative_path, variant)? else {
-            return Ok(None);
+        let path = match build_thumbnail(
+            &root,
+            &relative_path,
+            variant,
+            profile,
+            cache_only.unwrap_or(false),
+        ) {
+            Ok(Some(path)) => {
+                clear_preview_failure(&root, &relative_path);
+                path
+            }
+            Ok(None) => {
+                if !cache_only.unwrap_or(false) {
+                    record_preview_failure(&root, &relative_path, "沒有可用的本機預覽來源");
+                }
+                return Ok(None);
+            }
+            Err(error) => {
+                record_preview_failure(&root, &relative_path, &error);
+                return Err(error);
+            }
         };
         register_preview_source(
             &preview_state,
@@ -1271,6 +1487,8 @@ fn photo_from_disk(candidate: &ScanCandidate, decisions: &HashMap<String, (Strin
         lens: exif.lens,
         captured_at: exif.captured_at,
         exposure: exif.exposure,
+        aperture: exif.aperture,
+        iso: exif.iso,
         focal_length: exif.focal_length,
         exposure_compensation: exif.exposure_compensation,
         dimensions: exif.dimensions,
@@ -1302,6 +1520,8 @@ fn photo_from_index(
         lens: indexed.lens.clone(),
         captured_at: indexed.captured_at.clone(),
         exposure: indexed.exposure.clone(),
+        aperture: indexed.aperture.clone(),
+        iso: indexed.iso.clone(),
         focal_length: indexed.focal_length.clone(),
         exposure_compensation: indexed.exposure_compensation.clone(),
         dimensions: indexed.dimensions.clone(),
@@ -1476,7 +1696,9 @@ fn save_decisions_batch(
     let transaction = connection
         .transaction()
         .map_err(|error| format!("無法開始批次儲存旗標：{error}"))?;
+    let batch_id = history_batch_id();
     for relative_path in &relative_paths {
+        let (previous_decision, previous_rating) = current_decision(&transaction, relative_path)?;
         transaction
             .execute(
                 "INSERT INTO decisions(relative_path, decision, rating, updated_at) VALUES (?1, ?2, 0, unixepoch())
@@ -1484,6 +1706,15 @@ fn save_decisions_batch(
                 params![relative_path, decision],
             )
             .map_err(|error| format!("無法儲存旗標：{error}"))?;
+        record_decision_history(
+            &transaction,
+            &batch_id,
+            relative_path,
+            &previous_decision,
+            &decision,
+            previous_rating,
+            previous_rating,
+        )?;
         if cfg!(target_os = "macos") {
             transaction
                 .execute(
@@ -1523,7 +1754,9 @@ fn save_ratings_batch(root: String, relative_paths: Vec<String>, rating: u8) -> 
     let transaction = connection
         .transaction()
         .map_err(|error| format!("無法開始批次儲存星等：{error}"))?;
+    let batch_id = history_batch_id();
     for relative_path in &relative_paths {
+        let (previous_decision, previous_rating) = current_decision(&transaction, relative_path)?;
         transaction
             .execute(
                 "INSERT INTO decisions(relative_path, decision, rating, updated_at) VALUES (?1, 'unreviewed', ?2, unixepoch())
@@ -1531,10 +1764,537 @@ fn save_ratings_batch(root: String, relative_paths: Vec<String>, rating: u8) -> 
                 params![relative_path, rating],
             )
             .map_err(|error| format!("無法儲存星等：{error}"))?;
+        record_decision_history(
+            &transaction,
+            &batch_id,
+            relative_path,
+            &previous_decision,
+            &previous_decision,
+            previous_rating,
+            rating,
+        )?;
     }
     transaction
         .commit()
         .map_err(|error| format!("無法完成批次儲存星等：{error}"))?;
+    Ok(())
+}
+
+fn history_batch_id() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    format!(
+        "{seconds}-{:x}",
+        THUMBNAIL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn record_decision_history(
+    connection: &rusqlite::Transaction<'_>,
+    batch_id: &str,
+    relative_path: &str,
+    previous_decision: &str,
+    next_decision: &str,
+    previous_rating: u8,
+    next_rating: u8,
+) -> Result<(), String> {
+    if previous_decision == next_decision && previous_rating == next_rating {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "INSERT INTO decision_history(
+                batch_id, relative_path, previous_decision, next_decision, previous_rating, next_rating, changed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, unixepoch())",
+            params![batch_id, relative_path, previous_decision, next_decision, previous_rating, next_rating],
+        )
+        .map_err(|error| format!("無法記錄決定歷程：{error}"))?;
+    Ok(())
+}
+
+fn current_decision(
+    connection: &rusqlite::Transaction<'_>,
+    relative_path: &str,
+) -> Result<(String, u8), String> {
+    match connection.query_row(
+        "SELECT decision, rating FROM decisions WHERE relative_path = ?1",
+        [relative_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(value) => Ok(value),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(("unreviewed".into(), 0)),
+        Err(error) => Err(format!("無法讀取既有決定：{error}")),
+    }
+}
+
+#[tauri::command]
+fn decision_history(
+    root: String,
+    relative_path: String,
+) -> Result<Vec<DecisionHistoryEntry>, String> {
+    let root = PathBuf::from(root);
+    library_photo_path(&root, &relative_path)?;
+    let connection = open_manifest(&root)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, batch_id, relative_path, previous_decision, next_decision, previous_rating, next_rating, changed_at
+             FROM decision_history WHERE relative_path = ?1 ORDER BY id DESC LIMIT 30",
+        )
+        .map_err(|error| format!("無法讀取決定歷程：{error}"))?;
+    let history = statement
+        .query_map([relative_path], |row| {
+            Ok(DecisionHistoryEntry {
+                id: row.get(0)?,
+                batch_id: row.get(1)?,
+                relative_path: row.get(2)?,
+                previous_decision: row.get(3)?,
+                next_decision: row.get(4)?,
+                previous_rating: row.get(5)?,
+                next_rating: row.get(6)?,
+                changed_at: row.get(7)?,
+            })
+        })
+        .map_err(|error| format!("無法讀取決定歷程：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("無法讀取決定歷程：{error}"))?;
+    Ok(history)
+}
+
+#[tauri::command]
+fn restore_history_entry(root: String, id: i64) -> Result<(), String> {
+    let root = PathBuf::from(root);
+    let mut connection = open_manifest(&root)?;
+    let entry = connection
+        .query_row(
+            "SELECT relative_path, previous_decision, previous_rating FROM decision_history WHERE id = ?1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u8>(2)?)),
+        )
+        .map_err(|error| format!("找不到可還原的決定歷程：{error}"))?;
+    library_photo_path(&root, &entry.0)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("無法開始還原：{error}"))?;
+    let (previous_decision, previous_rating) = current_decision(&transaction, &entry.0)?;
+    transaction.execute(
+        "INSERT INTO decisions(relative_path, decision, rating, updated_at) VALUES (?1, ?2, ?3, unixepoch())
+         ON CONFLICT(relative_path) DO UPDATE SET decision = excluded.decision, rating = excluded.rating, updated_at = unixepoch()",
+        params![entry.0, entry.1, entry.2],
+    ).map_err(|error| format!("無法還原決定：{error}"))?;
+    if cfg!(target_os = "macos") {
+        transaction.execute(
+            "INSERT INTO native_sync_queue(relative_path, decision, queued_at, attempts, last_error)
+             VALUES (?1, ?2, unixepoch(), 0, NULL)
+             ON CONFLICT(relative_path) DO UPDATE SET decision = excluded.decision, queued_at = excluded.queued_at, attempts = 0, last_error = NULL",
+            params![entry.0, entry.1],
+        ).map_err(|error| format!("無法排入 Finder 標籤同步：{error}"))?;
+    }
+    record_decision_history(
+        &transaction,
+        &history_batch_id(),
+        &entry.0,
+        &previous_decision,
+        &entry.1,
+        previous_rating,
+        entry.2,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("無法完成還原：{error}"))?;
+    let _ = flush_native_sync_queue(&root, &connection);
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_review_session(root: String) -> Result<Option<ReviewSession>, String> {
+    let connection = open_manifest(Path::new(&root))?;
+    match connection.query_row(
+        "SELECT id, started_at, updated_at, paused_at, active_path, reviewed_count, total_count
+         FROM review_sessions ORDER BY paused_at IS NULL DESC, updated_at DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(ReviewSession {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                updated_at: row.get(2)?,
+                paused_at: row.get(3)?,
+                active_path: row.get(4)?,
+                reviewed_count: row.get::<_, i64>(5)? as usize,
+                total_count: row.get::<_, i64>(6)? as usize,
+            })
+        },
+    ) {
+        Ok(session) => Ok(Some(session)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("無法讀取工作階段：{error}")),
+    }
+}
+
+#[tauri::command]
+fn update_review_session(
+    root: String,
+    id: Option<String>,
+    active_path: Option<String>,
+    reviewed_count: usize,
+    total_count: usize,
+    paused: bool,
+) -> Result<ReviewSession, String> {
+    let connection = open_manifest(Path::new(&root))?;
+    let id = id.unwrap_or_else(history_batch_id);
+    connection.execute(
+        "INSERT INTO review_sessions(id, started_at, updated_at, paused_at, active_path, reviewed_count, total_count)
+         VALUES (?1, unixepoch(), unixepoch(), CASE WHEN ?6 THEN unixepoch() ELSE NULL END, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET updated_at = unixepoch(), paused_at = CASE WHEN ?6 THEN unixepoch() ELSE NULL END,
+             active_path = excluded.active_path, reviewed_count = excluded.reviewed_count, total_count = excluded.total_count",
+        params![id, active_path, reviewed_count as i64, total_count as i64, 0_i64, paused],
+    ).map_err(|error| format!("無法更新工作階段：{error}"))?;
+    resume_review_session(root)?.ok_or_else(|| "無法讀取工作階段".into())
+}
+
+#[tauri::command]
+fn create_review_snapshot(root: String, label: String) -> Result<String, String> {
+    let root_path = PathBuf::from(root);
+    let connection = open_manifest(&root_path)?;
+    let mut statement = connection.prepare("SELECT relative_path, decision, rating, updated_at FROM decisions ORDER BY relative_path")
+        .map_err(|error| format!("無法讀取決定：{error}"))?;
+    let decisions = statement.query_map([], |row| Ok(serde_json::json!({
+        "relativePath": row.get::<_, String>(0)?, "decision": row.get::<_, String>(1)?, "rating": row.get::<_, u8>(2)?, "updatedAt": row.get::<_, i64>(3)?
+    }))).map_err(|error| format!("無法讀取決定：{error}"))?
+      .collect::<Result<Vec<_>, _>>().map_err(|error| format!("無法讀取決定：{error}"))?;
+    let id = format!("snapshot-{}", history_batch_id());
+    let state = serde_json::json!({"schema": 1, "createdAt": std::time::SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or(0), "decisions": decisions});
+    let content = serde_json::to_string_pretty(&state).map_err(|error| error.to_string())?;
+    let directory = root_path.join(".cadris").join("snapshots");
+    fs::create_dir_all(&directory).map_err(|error| format!("無法建立快照資料夾：{error}"))?;
+    fs::write(directory.join(format!("{id}.json")), &content)
+        .map_err(|error| format!("無法寫入快照：{error}"))?;
+    connection.execute("INSERT INTO review_snapshots(id, label, created_at, state_json) VALUES (?1, ?2, unixepoch(), ?3)", params![id, label, content])
+        .map_err(|error| format!("無法記錄快照：{error}"))?;
+    Ok(id)
+}
+
+#[tauri::command]
+fn export_decisions(root: String, request: ExportRequest) -> Result<(), String> {
+    let root_path = PathBuf::from(root);
+    let connection = open_manifest(&root_path)?;
+    let mut statement = connection.prepare(
+        "SELECT p.relative_path, p.name, p.extension, p.camera, p.lens, p.captured_at, d.decision, d.rating
+         FROM library_photos p LEFT JOIN decisions d ON d.relative_path = p.relative_path ORDER BY p.relative_path",
+    ).map_err(|error| format!("無法準備匯出：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?
+                    .unwrap_or_else(|| "unreviewed".into()),
+                row.get::<_, Option<u8>>(7)?.unwrap_or(0),
+            ))
+        })
+        .map_err(|error| format!("無法讀取匯出資料：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("無法讀取匯出資料：{error}"))?;
+    let destination = PathBuf::from(request.destination);
+    match request.format.as_str() {
+        "csv" => {
+            let mut content = String::from(
+                "relative_path,name,extension,camera,lens,captured_at,decision,rating\n",
+            );
+            for row in rows {
+                content.push_str(
+                    &[
+                        row.0,
+                        row.1,
+                        row.2,
+                        row.3.unwrap_or_default(),
+                        row.4.unwrap_or_default(),
+                        row.5.unwrap_or_default(),
+                        row.6,
+                        row.7.to_string(),
+                    ]
+                    .iter()
+                    .map(|value| format!("\"{}\"", value.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                );
+                content.push('\n');
+            }
+            fs::write(&destination, content).map_err(|error| format!("無法寫入 CSV：{error}"))?;
+        }
+        "json" => {
+            let data = rows.into_iter().map(|row| serde_json::json!({"relativePath": row.0, "name": row.1, "extension": row.2, "camera": row.3, "lens": row.4, "capturedAt": row.5, "decision": row.6, "rating": row.7})).collect::<Vec<_>>();
+            fs::write(
+                &destination,
+                serde_json::to_string_pretty(&serde_json::json!({"schema": 1, "decisions": data}))
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("無法寫入 JSON：{error}"))?;
+        }
+        "xmp" => {
+            let destination = destination.join("Cadris XMP");
+            if destination.exists() {
+                return Err("選取的位置已有 Cadris XMP 輸出資料夾，請選擇另一個位置".into());
+            }
+            fs::create_dir_all(&destination)
+                .map_err(|error| format!("無法建立 XMP 輸出資料夾：{error}"))?;
+            for row in rows {
+                let sidecar = destination.join(Path::new(&row.0)).with_extension("xmp");
+                if let Some(parent) = sidecar.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|error| format!("無法建立 XMP 子資料夾：{error}"))?;
+                }
+                let label = match row.6.as_str() {
+                    "keep" => "Cadris Keep",
+                    "reject" => "Cadris Reject",
+                    _ => "",
+                };
+                let xmp = format!("<?xpacket begin=\"﻿\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:lr=\"http://ns.adobe.com/lightroom/1.0/\" xmp:Rating=\"{}\" lr:Label=\"{}\" /></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>", row.7, label);
+                fs::write(sidecar, xmp).map_err(|error| format!("無法寫入 XMP：{error}"))?;
+            }
+        }
+        _ => return Err("不支援的匯出格式".into()),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn native_sync_status(root: String) -> Result<NativeSyncStatus, String> {
+    let connection = open_manifest(Path::new(&root))?;
+    let mut statement = connection.prepare(
+        "SELECT relative_path, decision, queued_at, attempts, last_error FROM native_sync_queue ORDER BY queued_at DESC LIMIT 100",
+    ).map_err(|error| format!("無法讀取原生同步狀態：{error}"))?;
+    let issues = statement
+        .query_map([], |row| {
+            Ok(SyncIssue {
+                relative_path: row.get(0)?,
+                decision: row.get(1)?,
+                queued_at: row.get(2)?,
+                attempts: row.get(3)?,
+                last_error: row.get(4)?,
+            })
+        })
+        .map_err(|error| format!("無法讀取原生同步狀態：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("無法讀取原生同步狀態：{error}"))?;
+    Ok(NativeSyncStatus {
+        available: cfg!(target_os = "macos"),
+        pending: issues.len(),
+        issues,
+    })
+}
+
+#[tauri::command]
+fn retry_native_sync(root: String) -> Result<NativeSyncStatus, String> {
+    let root_path = PathBuf::from(&root);
+    let connection = open_manifest(&root_path)?;
+    flush_native_sync_queue(&root_path, &connection)?;
+    native_sync_status(root)
+}
+
+#[tauri::command]
+fn repair_native_sync(root: String) -> Result<NativeSyncStatus, String> {
+    let root_path = PathBuf::from(&root);
+    let connection = open_manifest(&root_path)?;
+    if cfg!(target_os = "macos") {
+        connection.execute(
+            "INSERT INTO native_sync_queue(relative_path, decision, queued_at, attempts, last_error)
+             SELECT relative_path, decision, unixepoch(), 0, NULL FROM decisions
+             ON CONFLICT(relative_path) DO UPDATE SET decision = excluded.decision, queued_at = excluded.queued_at, attempts = 0, last_error = NULL",
+            [],
+        ).map_err(|error| format!("無法重建 Finder 同步佇列：{error}"))?;
+        flush_native_sync_queue(&root_path, &connection)?;
+    }
+    native_sync_status(root)
+}
+
+fn configured_cache_limit_mb(connection: &Connection) -> u64 {
+    connection
+        .query_row(
+            "SELECT value FROM library_settings WHERE key = 'cache_limit_mb'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2048)
+        .clamp(256, 16_384)
+}
+
+fn cache_status_for(root: &Path, connection: &Connection) -> Result<CacheStatus, String> {
+    let mut bytes = 0;
+    let mut files = 0;
+    if let Ok(entries) = fs::read_dir(cache_directory(root)) {
+        for entry in entries.filter_map(Result::ok) {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    bytes += metadata.len();
+                    files += 1;
+                }
+            }
+        }
+    }
+    let mut statement = connection.prepare("SELECT relative_path, error, updated_at FROM preview_failures ORDER BY updated_at DESC LIMIT 100")
+        .map_err(|error| format!("無法讀取預覽失敗紀錄：{error}"))?;
+    let failures = statement
+        .query_map([], |row| {
+            Ok(PreviewFailure {
+                relative_path: row.get(0)?,
+                error: row.get(1)?,
+                updated_at: row.get(2)?,
+            })
+        })
+        .map_err(|error| format!("無法讀取預覽失敗紀錄：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("無法讀取預覽失敗紀錄：{error}"))?;
+    Ok(CacheStatus {
+        bytes,
+        files,
+        limit_mb: configured_cache_limit_mb(connection),
+        failures,
+    })
+}
+
+#[tauri::command]
+fn cache_status(root: String) -> Result<CacheStatus, String> {
+    let root_path = PathBuf::from(root);
+    let connection = open_manifest(&root_path)?;
+    cache_status_for(&root_path, &connection)
+}
+
+#[tauri::command]
+fn set_cache_limit(root: String, limit_mb: u64) -> Result<CacheStatus, String> {
+    let root_path = PathBuf::from(root);
+    let connection = open_manifest(&root_path)?;
+    let limit_mb = limit_mb.clamp(256, 16_384);
+    connection.execute("INSERT INTO library_settings(key, value) VALUES ('cache_limit_mb', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [limit_mb.to_string()])
+        .map_err(|error| format!("無法更新快取上限：{error}"))?;
+    prune_thumbnail_cache_to_limit(&cache_directory(&root_path), limit_mb * 1024 * 1024, None);
+    cache_status_for(&root_path, &connection)
+}
+
+#[tauri::command]
+fn clear_thumbnail_cache(root: String) -> Result<CacheStatus, String> {
+    let root_path = PathBuf::from(root);
+    let cache = cache_directory(&root_path);
+    if cache.exists() {
+        fs::remove_dir_all(&cache).map_err(|error| format!("無法清除衍生預覽快取：{error}"))?;
+    }
+    let connection = open_manifest(&root_path)?;
+    cache_status_for(&root_path, &connection)
+}
+
+fn average_hash(path: &Path) -> Option<(u64, f32, f32)> {
+    let reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    let image = image
+        .resize_exact(16, 16, image::imageops::FilterType::Triangle)
+        .to_luma8();
+    let values = image
+        .pixels()
+        .map(|pixel| pixel[0] as f32)
+        .collect::<Vec<_>>();
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f32>()
+        / values.len() as f32;
+    let mut hash = 0_u64;
+    for row in 0..8 {
+        for column in 0..8 {
+            let left = image.get_pixel(column * 2, row * 2)[0];
+            let right = image.get_pixel(column * 2 + 1, row * 2)[0];
+            if left > right {
+                hash |= 1 << (row * 8 + column);
+            }
+        }
+    }
+    Some((hash, mean, variance))
+}
+
+#[tauri::command]
+fn analyze_assistance(
+    root: String,
+    relative_paths: Vec<String>,
+) -> Result<Vec<AssistanceResult>, String> {
+    let root_path = PathBuf::from(root);
+    let paths = unique_library_paths(&root_path, relative_paths)?;
+    let entries = paths
+        .into_iter()
+        .filter_map(|relative_path| {
+            average_hash(&library_photo_path(&root_path, &relative_path).ok()?)
+                .map(|metrics| (relative_path, metrics))
+        })
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for (index, (relative_path, (hash, mean, variance))) in entries.iter().enumerate() {
+        let group = entries
+            .iter()
+            .enumerate()
+            .find(|(other_index, (_, (other_hash, _, _)))| {
+                *other_index != index && (*hash ^ *other_hash).count_ones() <= 7
+            })
+            .map(|(_, (other_path, _))| format!("相似：{}", other_path));
+        result.push(AssistanceResult {
+            relative_path: relative_path.clone(),
+            blur_hint: *variance < 120.0,
+            exposure_hint: (*mean < 38.0)
+                .then_some("偏暗".into())
+                .or_else(|| (*mean > 218.0).then_some("偏亮".into())),
+            similar_group: group,
+            eye_hint: None,
+        });
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+fn burst_best_frames(root: String) -> Result<Vec<BurstBestFrame>, String> {
+    let connection = open_manifest(Path::new(&root))?;
+    let mut statement = connection
+        .prepare("SELECT burst_id, relative_path FROM burst_best_frames")
+        .map_err(|error| format!("無法讀取連拍最佳照片：{error}"))?;
+    let frames = statement
+        .query_map([], |row| {
+            Ok(BurstBestFrame {
+                burst_id: row.get(0)?,
+                relative_path: row.get(1)?,
+            })
+        })
+        .map_err(|error| format!("無法讀取連拍最佳照片：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("無法讀取連拍最佳照片：{error}"))?;
+    Ok(frames)
+}
+
+#[tauri::command]
+fn save_burst_best_frame(
+    root: String,
+    burst_id: String,
+    relative_path: String,
+) -> Result<(), String> {
+    let root = PathBuf::from(root);
+    library_photo_path(&root, &relative_path)?;
+    let connection = open_manifest(&root)?;
+    connection.execute(
+        "INSERT INTO burst_best_frames(burst_id, relative_path, updated_at) VALUES (?1, ?2, unixepoch())
+         ON CONFLICT(burst_id) DO UPDATE SET relative_path = excluded.relative_path, updated_at = excluded.updated_at",
+        params![burst_id, relative_path],
+    ).map_err(|error| format!("無法設定連拍最佳照片：{error}"))?;
     Ok(())
 }
 
@@ -1650,7 +2410,22 @@ pub fn run() {
             save_decision,
             save_decisions_batch,
             save_rating,
-            save_ratings_batch
+            save_ratings_batch,
+            decision_history,
+            restore_history_entry,
+            resume_review_session,
+            update_review_session,
+            create_review_snapshot,
+            export_decisions,
+            native_sync_status,
+            retry_native_sync,
+            repair_native_sync,
+            cache_status,
+            set_cache_limit,
+            clear_thumbnail_cache,
+            analyze_assistance,
+            burst_best_frames,
+            save_burst_best_frame
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1680,6 +2455,8 @@ mod tests {
             lens: Some("XF 23mmF2".into()),
             captured_at: None,
             exposure: None,
+            aperture: None,
+            iso: None,
             focal_length: None,
             exposure_compensation: None,
             dimensions: None,
@@ -1735,15 +2512,33 @@ mod tests {
             .save(&source)
             .unwrap();
 
-        let first = build_thumbnail(&directory, "photo.png", ThumbnailVariant::Grid)
-            .unwrap()
-            .unwrap();
-        let second = build_thumbnail(&directory, "photo.png", ThumbnailVariant::Grid)
-            .unwrap()
-            .unwrap();
-        let detail = build_thumbnail(&directory, "photo.png", ThumbnailVariant::Detail)
-            .unwrap()
-            .unwrap();
+        let first = build_thumbnail(
+            &directory,
+            "photo.png",
+            ThumbnailVariant::Grid,
+            "balanced",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let second = build_thumbnail(
+            &directory,
+            "photo.png",
+            ThumbnailVariant::Grid,
+            "balanced",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let detail = build_thumbnail(
+            &directory,
+            "photo.png",
+            ThumbnailVariant::Detail,
+            "balanced",
+            false,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(first, second);
         let grid_image = image::open(&first).unwrap();
         assert_eq!((grid_image.width(), grid_image.height()), (560, 280));

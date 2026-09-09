@@ -20,6 +20,7 @@ type GalleryViewProps = {
   firstGalleryRow: number;
   lastGalleryRow: number;
   burstByPhoto: Map<string, BurstInfo>;
+  burstBestFrames: Map<string, string>;
   selectedPaths: Set<string>;
   comparison: string[];
   active: number;
@@ -30,11 +31,12 @@ type GalleryViewProps = {
   onRememberRatio: (relativePath: string, image: HTMLImageElement) => void;
 };
 
-function Card({ root, item, index, burst, isSelected, isCompared, isActive, square, width, onFocusPhoto, onSelectPhoto, onOpenLoupe, onRememberRatio }: {
+function Card({ root, item, index, burst, isBurstBest, isSelected, isCompared, isActive, square, width, onFocusPhoto, onSelectPhoto, onOpenLoupe, onRememberRatio }: {
   root: string;
   item: LibraryItem;
   index: number;
   burst?: BurstInfo;
+  isBurstBest: boolean;
   isSelected: boolean;
   isCompared: boolean;
   isActive: boolean;
@@ -48,13 +50,14 @@ function Card({ root, item, index, burst, isSelected, isCompared, isActive, squa
   const photo = item.primary;
   const className = `${square ? "card square-card" : "photo-card"} ${photo.decision}${isActive ? " selected" : ""}${isSelected ? " multi-selected" : ""}${isCompared ? " compare-selected" : ""}`;
   const label = `${photo.name}，${labels[photo.decision]}，${ratingLabel(photo.rating)}${item.kind === "pair" ? "，RAW 與 JPEG 配對" : ""}${burst ? `，連拍 ${burst.position + 1} / ${burst.total}` : ""}${isSelected ? "，已選取" : ""}${isCompared ? "，已加入比較" : ""}${isActive ? "，目前照片" : ""}`;
-  return <button type="button" id={optionId(photo.relativePath)} role="option" tabIndex={isActive ? 0 : -1} className={className} style={width ? { flexBasis: width } : undefined} aria-label={label} aria-selected={isSelected} onFocus={() => onFocusPhoto(index)} onClick={(event) => onSelectPhoto(index, event)} onDoubleClick={onOpenLoupe}><CachedPhotoImage root={root} photo={photo} alt="" loading="lazy" onLoad={(event) => onRememberRatio(photo.relativePath, event.currentTarget)} />{item.kind === "pair" && <span className="group-badge">RAW + JPEG · {item.photos.length}</span>}{burst && <span className="burst-badge">連拍 {burst.position + 1} / {burst.total}</span>}{square ? <div className="square-info"><small>{item.kind === "pair" ? item.photos.map((member) => member.extension).join(" + ") : photo.extension}</small></div> : photo.decision !== "unreviewed" && <span className="photo-status">{labels[photo.decision]}</span>}</button>;
+  return <button type="button" id={optionId(photo.relativePath)} role="option" tabIndex={isActive ? 0 : -1} className={className} style={width ? { flexBasis: width } : undefined} aria-label={label} aria-selected={isSelected} onFocus={() => onFocusPhoto(index)} onClick={(event) => onSelectPhoto(index, event)} onDoubleClick={onOpenLoupe}><CachedPhotoImage root={root} photo={photo} alt="" loading="lazy" onLoad={(event) => onRememberRatio(photo.relativePath, event.currentTarget)} />{item.kind === "pair" && <span className="group-badge">RAW + JPEG · {item.photos.length}</span>}{burst && <span className="burst-badge">連拍 {burst.position + 1} / {burst.total}</span>}{isBurstBest && <span className="best-badge">最佳</span>}{square ? <div className="square-info"><small>{item.kind === "pair" ? item.photos.map((member) => member.extension).join(" + ") : photo.extension}</small></div> : photo.decision !== "unreviewed" && <span className="photo-status">{labels[photo.decision]}</span>}</button>;
 }
 
-function getCardState(item: LibraryItem, index: number, props: Pick<GalleryViewProps, "burstByPhoto" | "selectedPaths" | "comparison" | "active">) {
+function getCardState(item: LibraryItem, index: number, props: Pick<GalleryViewProps, "burstByPhoto" | "burstBestFrames" | "selectedPaths" | "comparison" | "active">) {
   const photo = item.primary;
   return {
     burst: props.burstByPhoto.get(photo.relativePath),
+    isBurstBest: Boolean(props.burstByPhoto.get(photo.relativePath) && props.burstBestFrames.get(props.burstByPhoto.get(photo.relativePath)!.group.id) === photo.relativePath),
     isSelected: item.photos.every((member) => props.selectedPaths.has(member.relativePath)),
     isCompared: props.comparison.includes(photo.relativePath),
     isActive: index === props.active,
