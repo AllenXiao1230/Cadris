@@ -85,13 +85,26 @@ nav input::placeholder { color: var(--quiet); }
 .advanced-filter-row button { min-height: 32px; padding: 5px 8px; border-color: var(--border); border-radius: 8px; background: var(--control); color: var(--muted); font-size: 12px; }
 
 .bottom-dock { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px 14px; margin: 8px 12px 0; padding: 7px 9px; border-radius: 16px; background: var(--surface-subtle); }
-.dock-view, .dock-actions, .compare-controls, .decision-controls, .rating-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.dock-view, .dock-actions, .compare-controls, .decision-controls, .rating-controls, .review-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
 .dock-actions { justify-content: center; }
 .bottom-dock button, .loupe-controls button, .compare-toolbar button, .compare-pane header button { min-height: 34px; padding: 6px 9px; border-color: var(--border); border-radius: 9px; background: var(--control); color: var(--muted); font-size: 13px; }
 .bottom-dock .icon-button { min-width: 34px; padding: 6px; }
 .bottom-dock button.active, .bottom-dock button.selected, .settings-card .shortcut-capture.active { border-color: var(--border-strong); background: var(--accent-soft); color: var(--ink); }
 .bottom-dock .keep.selected { background: color-mix(in srgb, var(--success) 26%, transparent); color: var(--success); }
 .bottom-dock .reject.selected { border-color: color-mix(in srgb, var(--danger) 60%, transparent); background: var(--danger-soft); color: var(--danger); }
+.review-controls { flex-wrap: nowrap; gap: 0; min-height: 42px; padding: 4px; border: 1px solid color-mix(in srgb, var(--ink) 12%, transparent); border-radius: 999px; background: color-mix(in srgb, var(--app-background) 84%, black); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 7%, transparent), 0 6px 18px color-mix(in srgb, var(--app-background) 44%, black); }
+.review-controls .rating-controls, .review-controls .decision-controls { flex-wrap: nowrap; gap: 0; }
+.review-controls .rating-controls { padding-inline-end: 5px; border-inline-end: 1px solid var(--border); }
+.review-controls .decision-controls { padding-inline-start: 5px; }
+.review-controls button { display: grid; width: 34px; min-height: 34px; place-items: center; padding: 0; border: 0; border-radius: 8px; background: transparent; color: color-mix(in srgb, var(--quiet) 68%, transparent); }
+.review-controls .rating-button { width: 30px; }
+.review-controls .rating-button .icon { width: 18px; height: 18px; }
+.review-controls .rating-button.rating-active { color: var(--accent); }
+.review-controls .unreviewed { margin-inline-end: 4px; border-inline-end: 1px solid var(--border); border-radius: 0; }
+.review-controls .keep, .review-controls .reject { width: 36px; }
+.review-controls .keep.selected { background: color-mix(in srgb, var(--success) 23%, transparent); color: var(--success); }
+.review-controls .reject.selected { border: 0; background: var(--danger-soft); color: var(--danger); }
+.review-controls button:hover:not(:disabled) { background: var(--control-hover); }
 .compare-controls { padding-inline-start: 5px; border-inline-start: 1px solid var(--border); }
 .dock-zoom { display: flex; align-items: center; justify-self: end; gap: 7px; color: var(--muted); font-size: 13px; white-space: nowrap; }
 .dock-zoom input, .loupe-controls input { accent-color: var(--accent); }
